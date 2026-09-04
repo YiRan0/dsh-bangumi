@@ -163,7 +163,7 @@ const CSS = [
   '.bg_search{display:flex;gap:8px;margin-bottom:12px}',
   '.bg_input{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:8px 10px}',
   '.bg_subject{padding:10px 12px;margin-bottom:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-2)}',
-  '.bg_hit{display:inline-block;font-size:11px;color:#059669;background:rgba(5,150,105,.12);border-radius:6px;padding:2px 8px;margin-left:8px}',
+  '.bg_hit{display:inline-block;font-size:11px;color:#059669;background:rgba(5,150,105,.12);border-radius:6px;padding:2px 8px}',
   '.bg_torrent{display:flex;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-bottom:6px}',
   '.bg_tTitle{flex:1;min-width:0;font-size:12px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
   '.bg_chip{font-size:11px;color:var(--dsw-alias-label-tertiary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;white-space:nowrap}',
