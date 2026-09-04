@@ -61,8 +61,11 @@ function toSubject(raw: any): BangumiSubject {
     nameCn: raw.name_cn ?? '',
     // /v0/subjects 用 date 字段，/v0/search 结果同；air_date 是旧字段堡垒
     airDate: (raw.date || (raw.air_date && raw.air_date !== '0000-00-00' ? raw.air_date : '') || undefined) as string | undefined,
-    // eps=本篇集数；total_episodes 含特典，优先 eps
-    totalEpisodes: typeof raw.eps === 'number' && raw.eps > 0 ? raw.eps : typeof raw.total_episodes === 'number' && raw.total_episodes > 0 ? raw.total_episodes : undefined,
+    // 详情(v0/subjects)响应有 total_episodes（本篇+特典总数，bgm 权威）；搜索(v0/search)响应通常只有 eps。
+    // 二者都缺或为 0 时保持 undefined（调用方再以 episodes 表长度兜底）。
+    totalEpisodes: typeof raw.total_episodes === 'number' && raw.total_episodes > 0
+      ? raw.total_episodes
+      : typeof raw.eps === 'number' && raw.eps > 0 ? raw.eps : undefined,
     images: raw.images ?? undefined,
     summary: raw.summary ?? undefined,
     platform: typeof raw.platform === 'string' ? raw.platform : undefined,

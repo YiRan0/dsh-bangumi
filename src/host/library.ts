@@ -21,6 +21,10 @@ export interface LibraryFile {
   normTitle: string
   /** 扫描时的根目录（持久化行标记用） */
   root?: string
+  /** 作品目录键：任一媒体根之后的首个路径段（如「尼古喵喵」；顶层散文件为 undefined） */
+  dirKey?: string
+  /** 作品目录键的归一化标题（同 normalizeTitle(dirKey)） */
+  dirNorm?: string
 }
 
 export interface LibrarySnapshot {
@@ -28,6 +32,8 @@ export interface LibrarySnapshot {
   files: LibraryFile[]
   /** normTitle -> 集号 -> 最佳文件 */
   byTitle: Record<string, Record<string, LibraryFile>>
+  /** 作品目录(dirNorm) -> 集号 -> 最佳文件；目录是用户整理好的作品分界，比文件名碎片可靠 */
+  byDir: Record<string, Record<string, LibraryFile>>
   /** 扫描时间戳 ms */
   scannedAt: number
   /** 扫描的目录列表 */
@@ -86,6 +92,39 @@ export function buildByTitle(files: LibraryFile[]): Record<string, Record<string
   return byTitle
 }
 
+/** 作品目录键：任一媒体根之后的首个路径段；Downloads 顶层散文件无作品段 → undefined */
+export function dirKeyOf(f: LibraryFile, roots: string[]): string | undefined {
+  const norm = f.path.replace(/\\/g, '/')
+  for (const rootRaw of roots) {
+    const root = rootRaw.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+    const prefix = root + '/'
+    if (!norm.startsWith(prefix)) continue
+    const rest = norm.slice(prefix.length)
+    const seg = rest.split('/').filter(Boolean)[0]
+    if (seg) return seg
+  }
+  return undefined
+}
+
+/** 按作品目录聚合（byTitle 之外的兜底维度；同集保留更大的） */
+export function buildByDir(files: LibraryFile[], roots: string[]): Record<string, Record<string, LibraryFile>> {
+  const byDir: Record<string, Record<string, LibraryFile>> = {}
+  for (const f of files) {
+    if (f.parsed.episode === undefined) continue
+    const key = dirKeyOf(f, roots)
+    if (!key) continue
+    const norm = normalizeTitle(key)
+    if (!norm) continue
+    f.dirKey = key
+    f.dirNorm = norm
+    const epKey = String(f.parsed.episode)
+    const bucket = byDir[norm] ?? (byDir[norm] = {})
+    const prev = bucket[epKey]
+    if (!prev || prev.size < f.size) bucket[epKey] = f
+  }
+  return byDir
+}
+
 /** 全量扫描媒体库目录 */
 export async function scanLibrary(roots: string[]): Promise<LibrarySnapshot> {
   const files: LibraryFile[] = []
@@ -94,23 +133,78 @@ export async function scanLibrary(roots: string[]): Promise<LibrarySnapshot> {
     if (!r) continue
     await walk(r, 0, files)
   }
-  return { files, byTitle: buildByTitle(files), scannedAt: Date.now(), roots }
+  return { files, byTitle: buildByTitle(files), byDir: buildByDir(files, roots), scannedAt: Date.now(), roots }
 }
 
 /**
  * 一个订阅（含别名）在库里已拥有的集号集合。
- * 匹配维度：别名归一后被库 normTitle 包含 / 或库 normTitle 被别名包含。
+ * 匹配维度（两路取集数更全者）：
+ *  A. 文件名维度：别名归一后被库 normTitle 包含 / 或库 normTitle 被别名包含（原逻辑）
+ *  B. 作品目录维度：别名与目录 dirNorm 匹配——目录是用户整理的作品分界，
+ *     发布组花式文件名（Yani.Neko / Mushoku Tensei / Jaadugar…）碎成几十个 normTitle 时，
+ *     目录仍是干净的「尼古喵喵 / 穹庐下的魔女」，与 bgm 中文别名直接对上。
  */
 export function findEpisodesInLibrary(snapshot: LibrarySnapshot | null, aliases: string[]): { episodes: number[]; matchedTitle?: string; count: number } {
   if (!snapshot || aliases.length === 0) return { episodes: [], count: 0 }
   const norms = aliases.map(normalizeTitle).filter((s) => s.length > 0)
+  if (norms.length === 0) return { episodes: [], count: 0 }
+  const epsOf = (eps: Record<string, LibraryFile>): number[] =>
+    Object.keys(eps).map((k) => parseFloat(k)).filter((n) => !Number.isNaN(n)).sort((a, b) => a - b)
   let best: { title: string; episodes: number[] } | undefined
-  for (const [normTitle, eps] of Object.entries(snapshot.byTitle)) {
-    const hit = norms.some((n) => normTitle.includes(n) || n.includes(normTitle))
-    if (!hit) continue
-    const episodes = Object.keys(eps).map((k) => parseFloat(k)).filter((n) => !Number.isNaN(n)).sort((a, b) => a - b)
-    if (!best || episodes.length > best.episodes.length) best = { title: normTitle, episodes }
+  const consider = (key: string, eps: Record<string, LibraryFile>): void => {
+    const hit = norms.some((n) => key.includes(n) || n.includes(key))
+    if (!hit) return
+    const episodes = epsOf(eps)
+    if (!best || episodes.length > best.episodes.length) best = { title: key, episodes }
   }
+  for (const [normTitle, eps] of Object.entries(snapshot.byTitle)) consider(normTitle, eps)
+  for (const [dirNorm, eps] of Object.entries(snapshot.byDir)) consider(dirNorm, eps)
   if (!best) return { episodes: [], count: 0 }
   return { episodes: best.episodes, matchedTitle: best.title, count: best.episodes.length }
+}
+
+/** 供海报墙用的候选条目（本地标题 → bgm 条目反查的最小形状） */
+export interface PosterCandidate {
+  id: number
+  aliases: string[]
+  name: string
+  nameCn?: string
+  airDate?: string
+  totalEpisodes?: number
+  images?: BangumiImageSet
+  platform?: string
+  summary?: string
+}
+
+export interface BangumiImageSet {
+  large?: string
+  common?: string
+  grid?: string
+}
+
+/** 一个本地标题是否能匹配候选（别名归一后双向包含，规则同 findEpisodesInLibrary） */
+export function titleMatchesCandidate(localTitle: string, cand: PosterCandidate): boolean {
+  const norm = normalizeTitle(localTitle)
+  if (!norm) return false
+  const names: string[] = []
+  if (cand.name) names.push(cand.name)
+  if (cand.nameCn) names.push(cand.nameCn)
+  for (const a of cand.aliases ?? []) names.push(a)
+  return names.map(normalizeTitle).filter((s) => s.length > 0).some((n) => norm.includes(n) || n.includes(norm))
+}
+
+/** 反查：给定候选列表，找能匹配该本地标题的最佳候选（取别名最长的那个，防泛化误配） */
+export function findBestCandidate(localTitle: string, cands: PosterCandidate[]): PosterCandidate | undefined {
+  let best: PosterCandidate | undefined
+  let bestLen = -1
+  for (const c of cands) {
+    if (!titleMatchesCandidate(localTitle, c)) continue
+    const aliasLens: number[] = []
+    if (c.name) aliasLens.push(c.name.length)
+    if (c.nameCn) aliasLens.push(c.nameCn.length)
+    for (const a of c.aliases ?? []) aliasLens.push(a.length)
+    const aliasLen = Math.max(0, ...aliasLens)
+    if (aliasLen > bestLen) { best = c; bestLen = aliasLen }
+  }
+  return best
 }

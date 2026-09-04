@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS episodes_cache (
   subject_id INTEGER PRIMARY KEY,
   payload TEXT NOT NULL,
   saved_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cover_cache (
+  subject_id INTEGER PRIMARY KEY,
+  url TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  content_type TEXT,
+  saved_at INTEGER NOT NULL
 );`
 
 type Row = Record<string, any>
@@ -217,6 +224,20 @@ class BangumiDb {
   setSubjectCache(id: number, subject: BangumiSubject, aliases: string[]): void {
     this.db.prepare('INSERT OR REPLACE INTO subject_cache (id,payload,saved_at) VALUES (?,?,?)').run(id, JSON.stringify({ subject, aliases }), Date.now())
   }
+  /** 枚举全部缓存条目（含过期）——海报墙把本地标题匹配到条目拿封面用 */
+  listSubjectCacheAll(): Array<{ id: number; subject: BangumiSubject; aliases: string[] }> {
+    const rows = this.db.prepare('SELECT id, payload FROM subject_cache').all() as Row[]
+    const out: Array<{ id: number; subject: BangumiSubject; aliases: string[] }> = []
+    for (const row of rows) {
+      try {
+        const p = JSON.parse(String(row.payload))
+        if (p && typeof p.subject === 'object' && p.subject !== null) {
+          out.push({ id: Number(row.id), subject: p.subject as BangumiSubject, aliases: Array.isArray(p.aliases) ? p.aliases as string[] : [] })
+        }
+      } catch { /* 单条损坏跳过 */ }
+    }
+    return out
+  }
   getEpisodesCache(subjectId: number): { episodes: BangumiEpisode[]; savedAt: number } | null {
     const row = this.db.prepare('SELECT payload, saved_at FROM episodes_cache WHERE subject_id = ?').get(subjectId) as Row | undefined
     if (!row) return null
@@ -227,6 +248,17 @@ class BangumiDb {
   }
   setEpisodesCache(subjectId: number, episodes: BangumiEpisode[]): void {
     this.db.prepare('INSERT OR REPLACE INTO episodes_cache (subject_id,payload,saved_at) VALUES (?,?,?)').run(subjectId, JSON.stringify(episodes), Date.now())
+  }
+
+  // ---------- 封面图本地缓存（BLOB；URL 变化即视为过期，重拉后刷新） ----------
+  getSubjectCover(subjectId: number, url: string): { bytes: Uint8Array; contentType: string } | null {
+    const row = this.db.prepare('SELECT url, bytes, content_type FROM cover_cache WHERE subject_id = ?').get(subjectId) as Row | undefined
+    if (!row || row.url !== url) return null
+    return { bytes: row.bytes as Uint8Array, contentType: String(row.content_type ?? 'image/jpeg') }
+  }
+  putSubjectCover(subjectId: number, url: string, bytes: Uint8Array, contentType: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO cover_cache (subject_id,url,bytes,content_type,saved_at) VALUES (?,?,?,?,?)')
+      .run(subjectId, url, bytes, contentType, Date.now())
   }
 
   // ---------- 元数据 ----------
@@ -276,7 +308,7 @@ function rowToSub(r: Row): Subscription {
   return {
     id: r.id, bangumiId: Number(r.bangumi_id), name: r.name, nameCn: r.name_cn ?? '',
     aliases: JSON.parse(r.aliases ?? '[]'),
-    totalEpisodes: r.total_episodes ?? undefined, airDate: r.air_date ?? undefined,
+    totalEpisodes: r.total_episodes ?? undefined, season: r.season ?? undefined, airDate: r.air_date ?? undefined,
     weekday: r.weekday ?? undefined, source: r.source, group: r.group_name ?? undefined,
     resolution: r.resolution ?? undefined, query: r.query ?? '',
     rssRuleName: r.rss_rule_name, feedUrl: r.feed_url, rssItemPath: r.rss_item_path ?? undefined,

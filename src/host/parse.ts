@@ -158,14 +158,19 @@ export function detectPack(raw: string): PackInfo | null {
   let seasonFull = false
   const rm = multiSeason ? null : rangeRe.exec(t)
   if (rm && !multiSeason) {
-    const f = parseFloat(rm[1]); const e = parseFloat(rm[2])
-    if (f <= e) {
-      from = f; to = e
-      rangeRaw = rm[0].trim()
-      const after = t.slice(rm.index + rm[0].length, rm.index + rm[0].length + 24)
-      if (/SP|特典|OVA|总集编/i.test(after)) flags.push('range-with-sp')
-      flags.push('range:' + rm[0].trim())
-      if (spanCount(from, to) >= 8) flags.push('wide-range:' + spanCount(from, to))
+    // 季号守卫：S3 - 07 / Season 2 - 05 / S1 - 08 是「季号 + 单集号」，不是区间包 3-07。
+    // rangeRe 的 [^0-9] 前导会吃掉季号字母 S，把季号数字当区间起点（真实样本 LoliHouse「S3 - 07」被误判 3-07）。
+    const seasonLead = /^S\s*\d{1,2}/i.test(rm[0]) || /^Season\s*\d{1,2}/i.test(rm[0])
+    if (!seasonLead) {
+      const f = parseFloat(rm[1]); const e = parseFloat(rm[2])
+      if (f <= e) {
+        from = f; to = e
+        rangeRaw = rm[0].trim()
+        const after = t.slice(rm.index + rm[0].length, rm.index + rm[0].length + 24)
+        if (/SP|特典|OVA|总集编/i.test(after)) flags.push('range-with-sp')
+        flags.push('range:' + rm[0].trim())
+        if (spanCount(from, to) >= 8) flags.push('wide-range:' + spanCount(from, to))
+      }
     }
   }
 
@@ -174,7 +179,8 @@ export function detectPack(raw: string): PackInfo | null {
   const wm = wordRe.exec(t)
   if (wm) flags.push(wm[0].toLowerCase())
 
-  if (multiSeason || rm || wm) {
+  // rm 仅在真正解析出区间（from/to 有值）时才算 pack；季号守卫跳过时 rm 不生效
+  if (multiSeason || (rm && from !== undefined) || wm) {
     let season: number | undefined
     const sRe = /\bS(\d{1,2})\b(?!E\d)/i
     const sm = sRe.exec(t)
