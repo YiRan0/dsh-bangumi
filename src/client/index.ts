@@ -31,7 +31,10 @@ const zh = {
   mon: '一', tue: '二', wed: '三', thu: '四', fri: '五', sat: '六', sun: '日', prev: '‹', next: '›',
   localEpShort: '本地', aired: '已放送', matchedNone: '（库中作品，未匹配番剧条目）', clickForDetail: '点击查看详情',
   subscribe: '订阅', subscribeTo: '去检索订阅', inLibrary: '库中集数', noSummary: '暂无简介',
+  aiBox: 'AI 判新（强介入）', aiEnabled: '启用 AI 判新', aiProvider: '模型供应商', aiModel: '模型',
+  aiNone: '（未启用）', aiLoadingModels: '加载模型…', aiNote: '每轮判新 / 下载 / 媒体库扫描由 AI 把关；调用失败自动回退纯脚本。',
 }
+
 
 type Dict = typeof zh
 const en: Dict = {
@@ -50,7 +53,10 @@ const en: Dict = {
   mon: 'Mo', tue: 'Tu', wed: 'We', th: 'Thu', fri: 'Fr', sat: 'Sa', sun: 'Su', prev: '‹', next: '›',
   localEpShort: 'Local', aired: 'Aired', matchedNone: '（in library, no bgm match yet）', clickForDetail: 'Click for details',
   subscribe: 'Subscribe', subscribeTo: 'Subscribe via Search', inLibrary: 'In library', noSummary: 'No summary',
+  aiBox: 'AI gate (strong)', aiEnabled: 'Enable AI judging', aiProvider: 'Provider', aiModel: 'Model',
+  aiNone: '(disabled)', aiLoadingModels: 'Loading models…', aiNote: 'AI reviews each poll / download / library scan; falls back to script on failure.',
 }
+
 
 const isZh = typeof navigator !== 'undefined' && (navigator.language || '').toLowerCase().startsWith('zh')
 const t: Dict = isZh ? zh : en
@@ -149,6 +155,9 @@ const CSS = [
   '.bg_close{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:none;border-radius:8px;padding:4px 10px;font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}',
   '.bg_view{flex:1;min-height:0;overflow:auto;padding:14px 16px}',
   '.bg_rows{display:flex;flex-direction:column;gap:8px}',
+  '.bg_subToolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px}',
+  '.bg_subCount{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+  '.bg_subToolbar .bg_btn{padding:3px 10px;font-size:11px}',
   '.bg_row{display:flex;gap:12px;align-items:center;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-2)}',
   '.bg_rowMain{flex:1;min-width:0}',
   '.bg_rowTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -172,6 +181,15 @@ const CSS = [
   '.bg_label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
   '.bg_textarea{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;padding:8px 10px;min-height:72px;resize:vertical}',
   '.bg_grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px}',
+  '.bg_select{width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:8px 10px}',
+  '.bg_aiBox{border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-2);padding:12px;margin-top:14px}',
+  '.bg_aiBox h4{margin:0 0 8px;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+  '.bg_aiRow{display:flex;align-items:center;gap:10px;margin-bottom:10px}',
+  '.bg_aiRow .bg_label{flex:none;width:84px}',
+  '.bg_aiRow .bg_select{flex:1}',
+  '.bg_aiNote{font-size:11px;color:var(--dsw-alias-label-tertiary);margin-top:2px}',
+  '.bg_aiToggle{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:var(--dsw-alias-label-primary)}',
+  '.bg_aiToggle input{width:15px;height:15px;accent-color:#0e7490}',
   '.bg_cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}',
   '.bg_calHead{font-size:11px;text-align:center;color:var(--dsw-alias-label-tertiary);padding:4px 0}',
   '.bg_cell{min-height:72px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:4px 6px;overflow:hidden}',
@@ -248,6 +266,9 @@ function Subscriptions(): React.ReactElement {
   if (!rows) return h('div', { className: 'bg_empty' }, t.loading)
   if (!rows.length) return h('div', { className: 'bg_empty' }, t.noSubs)
   return h('div', { className: 'bg_rows' },
+    h('div', { className: 'bg_subToolbar' },
+      h('span', { className: 'bg_subCount' }, String(rows.length) + ' ' + t.subscriptions),
+      h('button', { className: 'bg_btn', onClick: () => void load() }, t.refresh)),
     rows.map((r) => h('div', { key: r.id, className: 'bg_row' },
       h('div', { className: 'bg_rowMain' },
         h('div', { className: 'bg_rowTitle' }, r.nameCn || r.name),
@@ -403,7 +424,7 @@ function SearchTab(): React.ReactElement {
           disabled: !it.magnet || !!doneMagnet[it.title],
           onClick: () => {
             if (!it.magnet) return
-            void api.post('/download', { magnet: it.magnet, title: it.title })
+            void api.post('/download', { magnet: it.magnet, title: it.title, bangumiId: detail.subject.id })
               .then(() => setDoneMagnet((m) => ({ ...m, [it.title]: true })))
               .catch((e) => setErr(String(e.message ?? e)))
           },
@@ -419,15 +440,43 @@ function SettingsTab(): React.ReactElement {
   const [saved, setSaved] = React.useState(false)
   const [scanning, setScanning] = React.useState(false)
   const [qb, setQb] = React.useState<{ ok?: boolean; version?: string; error?: string } | null>(null)
-  React.useEffect(() => {
-    void api.get('/settings').then((r) => setCfg(r.settings)).catch((e) => setErr(String(e.message ?? e)))
-    void api.get('/qb/status').then(setQb).catch((e) => setQb({ ok: false, error: String((e as any)?.message ?? e) }))
+  /* 媒体库目录文本框持有原文（不做逐键过滤/去空行）——否则行尾回车会因
+   * 空行被 filter(Boolean) 剔掉而被瞬时复位，导致永远无法新起一行添加目录。 */
+  const [dirsText, setDirsText] = React.useState('')
+  const [providers, setProviders] = React.useState<Array<{ id: string; name: string }> | null>(null)
+  const [models, setModels] = React.useState<Array<{ id: string; name: string }>>([])
+  const [modelsProvider, setModelsProvider] = React.useState('')
+  const [loadingModels, setLoadingModels] = React.useState(false)
+  /* 拉模型目录：providers 一次取；models 跟随当前 aiProvider（或首个 provider） */
+  const loadModels = React.useCallback((provider: string) => {
+    setLoadingModels(true); setModelsProvider(provider)
+    void api.get('/settings/models?provider=' + encodeURIComponent(provider))
+      .then((r) => setModels((r.models?.models as Array<{ id: string; name: string }>) ?? []))
+      .catch(() => setModels([]))
+      .finally(() => setLoadingModels(false))
   }, [])
+  React.useEffect(() => {
+    void api.get('/settings?models=1')
+      .then((r) => {
+        setCfg(r.settings); setDirsText((r.settings.mediaDirs ?? []).join('\n'))
+        const pv = (r.models?.providers ?? []) as Array<{ id: string; name: string }>
+        if (pv.length) {
+          setProviders(pv)
+          const cur = r.settings.aiProvider || pv[0].id
+          setModelsProvider(cur)
+          loadModels(cur)
+        } else { setProviders(null); setLoadingModels(false) }
+      })
+      .catch((e) => setErr(String(e.message ?? e)))
+    void api.get('/qb/status').then(setQb).catch((e) => setQb({ ok: false, error: String((e as any)?.message ?? e) }))
+  }, [loadModels])
   const update = (k: string, v: unknown) => setCfg((c: any) => ({ ...c, [k]: v }))
   const save = () => {
     setErr(''); setSaved(false)
-    void api.post('/settings', cfg)
-      .then((r) => { setCfg(r.settings); setSaved(true) })
+    /* 保存时才按行归一化（trim + 去空行），提交给 host 仍是数组 */
+    const payload = { ...cfg, mediaDirs: dirsText.split(/\r?\n/).map((s: string) => s.trim()).filter(Boolean) }
+    void api.post('/settings', payload)
+      .then((r) => { setCfg(r.settings); setDirsText((r.settings.mediaDirs ?? []).join('\n')); setSaved(true) })
       .catch((e) => setErr(String(e.message ?? e)))
   }
   if (!cfg) return h('div', { className: 'bg_empty' }, t.loading)
@@ -451,8 +500,9 @@ function SettingsTab(): React.ReactElement {
     h('label', { className: 'bg_field' },
       h('span', { className: 'bg_label' }, t.mediaDirs),
       h('textarea', {
-        className: 'bg_textarea', value: (cfg.mediaDirs ?? []).join('\n'),
-        onChange: (e: any) => update('mediaDirs', e.target.value.split(/\r?\n/).map((s: string) => s.trim()).filter(Boolean)),
+        className: 'bg_textarea', value: dirsText,
+        rows: Math.max(3, dirsText.split('\n').length),
+        onChange: (e: any) => setDirsText(e.target.value),
       }),
     ),
     h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
@@ -470,6 +520,48 @@ function SettingsTab(): React.ReactElement {
     qb ? h('div', { className: 'bg_rowSub', style: { marginTop: '10px' } },
       t.qbStatus + ': ' + (qb.ok ? 'OK (' + (qb.version ?? '?') + ')' : '✕ ' + (qb.error ?? 'fail')),
     ) : null,
+    /* ---- AI 判新（强介入）设置 ---- */
+    providers === null ? null : h('div', { className: 'bg_aiBox' },
+      h('h4', null, t.aiBox),
+      h('label', { className: 'bg_aiToggle' },
+        h('input', {
+          type: 'checkbox', checked: !!cfg.aiEnabled,
+          onChange: (e: any) => update('aiEnabled', e.target.checked),
+        }),
+        t.aiEnabled,
+      ),
+      h('div', { className: 'bg_aiRow' },
+        h('span', { className: 'bg_label' }, t.aiProvider),
+        h('select', {
+          className: 'bg_select',
+          value: cfg.aiProvider || modelsProvider || '',
+          onChange: (e: any) => {
+            const p = e.target.value
+            update('aiProvider', p)
+            setModelsProvider(p)
+            loadModels(p)
+            update('aiModel', '')
+          },
+        },
+          providers.map((p) => h('option', { key: p.id, value: p.id }, p.name || p.id)),
+        ),
+      ),
+      h('div', { className: 'bg_aiRow' },
+        h('span', { className: 'bg_label' }, t.aiModel),
+        loadingModels
+          ? h('span', { className: 'bg_rowSub' }, t.aiLoadingModels)
+          : h('select', {
+              className: 'bg_select',
+              value: cfg.aiModel || '',
+              onChange: (e: any) => update('aiModel', e.target.value),
+            },
+              models.length
+                ? models.map((m) => h('option', { key: m.id, value: m.id }, m.name || m.id))
+                : [h('option', { key: '__none', value: '' }, t.aiNone)],
+            ),
+      ),
+      h('div', { className: 'bg_aiNote' }, t.aiNote),
+    ),
   )
 }
 
@@ -740,6 +832,10 @@ function mountPage(controller: PanelController): () => void {
   const applyActive = () => {
     if (!controller.getSnapshot().open) {
       document.documentElement.removeAttribute(ACTIVE_ATTR)
+      root?.unmount()
+      root = undefined
+      container?.remove()
+      container = undefined
       return
     }
     suppressCompatibilityClose = true

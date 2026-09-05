@@ -6,7 +6,7 @@
  * 状态持久化：~/.dsh/dsh-bangumi/state.json（订阅 + 下载记录）。
  * REST：/api/bangumi/*（webServer.register prefix），client 面板直接 fetch 同路径。
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, appendFileSync, statSync, truncateSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -23,9 +23,19 @@ import { decideDownloads, collectHave, isCovered, type DecisionAction } from './
 import { QbClient } from './host/qb.js'
 import { dmhySearchUrl, fetchFeed, nyaaSearchUrl, searchDmhy, searchNyaa, type RssItem } from './host/rss.js'
 import { getState, saveState, type Subscription } from './host/store.js'
+import { AiReviewer, type AiReviewConfig, type LlmStreamLike } from './host/ai-review.js'
+
+const DBG = homedir() + '/.dsh/dsh-bangumi-debug.log'
+function dbg(msg: string): void {
+  try {
+    const st = statSync(DBG, { throwIfNoEntry: false })
+    if (st && st.size > 512 * 1024) truncateSync(DBG, Math.floor(st.size / 2)) // 超 512KB 截半防膨胀
+    appendFileSync(DBG, new Date().toISOString() + ' ' + msg + '\n')
+  } catch { /* ignore */ }
+}
 
 export const name = '@dsh-external/dsh-bangumi'
-export const inject = ['webServer', 'tools']
+export const inject = ['webServer', 'tools', 'llm']
 
 export interface Config {
   qbUrl: string
@@ -43,6 +53,11 @@ export interface Config {
   minMatchScore: number
   /** 订阅判新回看窗（天）：只自动下载订阅时刻起 N 天内新发布的集（防订阅即灌历史全集；连载周更天然每周 1-2 篇落窗内）；0=不限（慎用，会把 feed 内全部历史当新集） */
   rssIgnoreDays: number
+  /** AI 介入开关（强介入：每轮轮询/下载/媒体库扫描都经 AI 判断）；false=纯脚本 */
+  aiEnabled: boolean
+  /** AI 路由（provider/model；后台无会话，必须显式指定，如 deepseek-official/deepseek-chat） */
+  aiProvider: string
+  aiModel: string
 }
 
 export const Config = z.object({
@@ -59,6 +74,10 @@ export const Config = z.object({
   minMatchScore: z.number().default(60),
   // 订阅判新回看窗（天），默认 3：订阅 3 天内发布的新集自动下载
   rssIgnoreDays: z.number().default(3),
+  // AI 介入默认关（避免无配置时后台乱调模型）。开启需在 ~/.dsh/dsh-bangumi.json 设 aiEnabled+aiProvider+aiModel
+  aiEnabled: z.boolean().default(false),
+  aiProvider: z.string().default(''),
+  aiModel: z.string().default(''),
 })
 
 const FILE_CONFIG = join(homedir(), '.dsh', 'dsh-bangumi.json')
@@ -74,6 +93,9 @@ function loadFileConfig(): Partial<Config> {
     if (typeof obj.pollIntervalMinutes === 'number' && obj.pollIntervalMinutes > 0) out.pollIntervalMinutes = obj.pollIntervalMinutes
     if (typeof obj.minMatchScore === 'number') out.minMatchScore = obj.minMatchScore
     if (typeof obj.rssIgnoreDays === 'number' && obj.rssIgnoreDays >= 0) out.rssIgnoreDays = obj.rssIgnoreDays
+    if (typeof obj.aiEnabled === 'boolean') out.aiEnabled = obj.aiEnabled
+    if (typeof obj.aiProvider === 'string') out.aiProvider = obj.aiProvider
+    if (typeof obj.aiModel === 'string') out.aiModel = obj.aiModel
     return out
   } catch {
     return {}
@@ -96,6 +118,9 @@ function resolveConfig(config: Config): Config {
     pollIntervalMinutes: file.pollIntervalMinutes ?? config.pollIntervalMinutes,
     minMatchScore: file.minMatchScore ?? config.minMatchScore,
     rssIgnoreDays: file.rssIgnoreDays ?? config.rssIgnoreDays,
+    aiEnabled: file.aiEnabled ?? config.aiEnabled,
+    aiProvider: env.DSH_BANGUMI_AI_PROVIDER ?? file.aiProvider ?? config.aiProvider,
+    aiModel: env.DSH_BANGUMI_AI_MODEL ?? file.aiModel ?? config.aiModel,
   }
 }
 
@@ -105,6 +130,8 @@ interface Runtime {
   qb: QbClient
   library: LibrarySnapshot | null
   libraryScanning: boolean
+  /** AI 审核层（强介入；aiEnabled=false 时 enabled=false，各调用点回退纯脚本） */
+  ai: AiReviewer
 }
 
 interface SubjectBundle {
@@ -313,6 +340,54 @@ function pickTorrent(cands: ScoredItem[], prefer: { resolution?: string; group?:
 }
 
 /**
+ * 介入点2 — 下载前 AI 审核（强介入）：
+ * rt.ai.enabled 且 AI 判定不通过 → 返回 {ok:false}（调用方跳过该磁力，记日志）；
+ * AI 给出 alternativeMagnet → 替换下载目标；AI 未配置/调用失败(null) → 放行（AI 不阻塞脚本）。
+ */
+async function aiApproveDownload(
+  rt: Runtime,
+  info: {
+    subName: string
+    bangumiId?: number
+    episode?: number
+    full: boolean
+    title: string
+    magnet: string
+    group?: string
+    resolution?: string
+    score: number
+    haveEpisodes: number[]
+    totalEpisodes?: number
+  },
+  logger: { warn: (fmt: string, ...a: unknown[]) => void; info: (fmt: string, ...a: unknown[]) => void },
+): Promise<{ ok: boolean; magnet: string; title: string }> {
+  const base = { magnet: info.magnet, title: info.title }
+  if (!rt.ai.enabled) return { ok: true, ...base }
+  const verdict = await rt.ai.reviewDownload({
+    subName: info.subName,
+    episode: info.episode,
+    full: info.full,
+    title: info.title,
+    magnet: info.magnet,
+    group: info.group,
+    resolution: info.resolution,
+    score: info.score,
+    haveEpisodes: info.haveEpisodes,
+    totalEpisodes: info.totalEpisodes,
+  })
+  if (!verdict) return { ok: true, ...base } // AI 失败 → 不阻塞
+  if (verdict.alternativeMagnet && verdict.alternativeMagnet.startsWith('magnet:?xt=')) {
+    logger.info('bangumi ai-swap-magnet: %s (%s)', info.subName, verdict.reason)
+    return { ok: true, magnet: verdict.alternativeMagnet, title: info.title }
+  }
+  if (!verdict.approve) {
+    logger.info('bangumi ai-veto-download: %s ep=%s %s (%s)', info.subName, info.episode ?? '全集', info.title.slice(0, 60), verdict.reason)
+    return { ok: false, ...base }
+  }
+  return { ok: true, ...base }
+}
+
+/**
  * 自管判新核心（决策树 v3，2026-09-04 需求定稿）：
  *  1. 拉订阅 feed → 打分（别名/集号/分辨率/组/seeders；整包/全集识别）
  *  2. 判断完结态：bgm episodes 端点缓存无未来日期 → finished（缓存 6h）
@@ -335,26 +410,28 @@ async function pollSubscriptions(rt: Runtime, logger: { warn: (fmt: string, ...a
         preferGroup: sub.group,
         seasonOnly: sub.season ?? 1, // 只认订阅季（跨季合集若含本季仍收）
       })
-      // 窗口过滤：完结番全集不受限；连载番只收回看窗内（不补远古历史缺集）与上次检查后的新文
+      // 窗口过滤：完结番全集不受限；连载番收回看窗内（3 天内发布）的候选。
+      // 注意：不再要求 pub > lastCheckAt——「已发布但当时漏下」的窗内缺集（如切源/订阅
+      // 后补历史）也应能补；是否真缺由决策层判断（已有集不会重复下）。远古条目仍被
+      // cursorFloor 挡在窗外，防订阅即拉全集。lastCheckAt 仅作状态记录。
       const lookback = rt.cfg.rssIgnoreDays * 86400_000
       const cursorFloor = Date.now() - lookback
       const windowed = ranked.filter((c) => {
         if (c.pack?.isPack) return true // 整包（全集）始终候选（完结判定在决策层把关）
         const pub = c.item.pubDate ? new Date(c.item.pubDate).getTime() : Date.now()
-        const afterLast = !sub.lastCheckAt || pub > sub.lastCheckAt
-        return afterLast && pub >= cursorFloor && c.score >= rt.cfg.minMatchScore
+        return pub >= cursorFloor && c.score >= rt.cfg.minMatchScore
       })
       // 完结态（bgm episodes 缓存；拉取失败沿用旧 status）
       let finished = sub.status === 'finished'
+      let epsAll = await getEpisodesCached(sub.bangumiId).catch(() => [] as Array<{ ep: number; airDate?: string }>)
       if (sub.status !== 'finished') {
         try {
-          const eps = await getEpisodesCached(sub.bangumiId)
-          if (eps.length) {
+          if (epsAll.length) {
             const today = new Date()
             today.setHours(0, 0, 0, 0)
-            const hasFuture = eps.some((e) => e.airDate && new Date(e.airDate + 'T00:00:00').getTime() > today.getTime())
-            finished = !hasFuture && eps.length > 0 // 全部定档且无未来日期 = 已放送完（完结）
-            if (eps.length === 1 && hasFuture) finished = false
+            const hasFuture = epsAll.some((e) => e.airDate && new Date(e.airDate + 'T00:00:00').getTime() > today.getTime())
+            finished = !hasFuture && epsAll.length > 0 // 全部定档且无未来日期 = 已放送完（完结）
+            if (epsAll.length === 1 && hasFuture) finished = false
           }
         } catch {
           /* bgm 不可达：沿用 */
@@ -388,11 +465,108 @@ async function pollSubscriptions(rt: Runtime, logger: { warn: (fmt: string, ...a
         preferGroup: sub.group,
       }
       const input2 = { ...input, candidates: windowed }
-      const dec = decideDownloads(input2)
+      let aiDecided: Awaited<ReturnType<AiReviewer['reviewCandidates']>> = null
+      let aiCandidates = windowed
+      dbg('ai-gate sub=' + sub.id + ' enabled=' + rt.ai.enabled + ' ranked=' + ranked.length + ' windowed=' + windowed.length + ' have=' + JSON.stringify([...have].sort((a: number, b: number) => a - b)))
+      if (rt.ai.enabled) {
+        // 已放送但本地没有的集号（供 AI 判断是否补历史）
+        const today = new Date(); today.setHours(0, 0, 0, 0)
+        const airedEps = epsAll.filter((e) => e.airDate && new Date(e.airDate + 'T00:00:00').getTime() <= today.getTime()).map((e) => e.ep)
+        const missingAired = airedEps.filter((n) => !have.has(n))
+        aiDecided = await rt.ai.reviewCandidates({
+          subName: sub.nameCn || sub.name,
+          bangumiId: sub.bangumiId,
+          totalEpisodes: sub.totalEpisodes,
+          finished,
+          haveEpisodes: [...have].sort((a, b) => a - b),
+          missingAired,
+          candidates: windowed.map((c) => ({
+            episode: c.parsed?.episode,
+            full: !!c.pack?.isPack,
+            range: c.pack?.rangeRaw,
+            title: c.item.title,
+            score: c.score,
+            pubDate: c.item.pubDate,
+            group: c.parsed?.group,
+          })),
+        })
+        if (aiDecided && aiDecided.decision === 'hold') {
+          // AI 判定本轮不下（画质/源不理想/放送未到等）
+          logger.info('bangumi ai-hold: sub=%s %s (%s)', sub.id, sub.nameCn || sub.name, aiDecided.reason)
+          sub.lastCheckAt = Date.now()
+          saveState(state)
+          continue
+        }
+        if (aiDecided && aiDecided.decision === 'download-selected') {
+          // 只下 AI 选中的集：筛出对应候选，交下方统一决策/下载循环
+          const sel = new Set(aiDecided.selectedEpisodes)
+          aiCandidates = windowed.filter((c) => c.parsed?.episode !== undefined && sel.has(c.parsed.episode))
+          logger.info('bangumi ai-select: sub=%s select [%s] of %s candidates (%s)',
+            sub.id, [...sel].sort((a, b) => a - b).join(','), windowed.length, aiDecided.reason)
+        }
+        if (aiDecided && aiDecided.decision === 'search-backfill') {
+          // AI 指出历史缺集需补搜：跨源搜索（dmhy 订阅读 nyaa，反之读 dmhy），
+          // 命中缺集的条目并入本轮候选走统一决策/下载循环（have 检查防重复）。
+          logger.info('bangumi ai-backfill: sub=%s missing %s (%s)', sub.id, aiDecided.backfillEpisodes.join(','), aiDecided.reason)
+          const want = new Set(aiDecided.backfillEpisodes)
+          try {
+            // 补搜关键词：遍历别名（日文/英文名在异源上才搜得到；中文名往往只命中中文站）
+            const base = (sub.nameCn || sub.name || '').replace(/第?[一二三四五]季/g, '').trim()
+            const kws = [base, ...(sub.aliases.filter((a) => normalizeTitle(a).length >= 3 && a !== base))].slice(0, 4)
+            let items: RssItem[] = []
+            let kwUsed = ''
+            for (const kw of kws) {
+              const hits = sub.source === 'dmhy' ? await searchNyaa(kw) : await searchDmhy(kw)
+              if (hits.length) { items = hits; kwUsed = kw; break }
+            }
+            dbg('ai-backfill-search sub=' + sub.id + ' kws=' + kws.join('|') + ' got=' + items.length + ' via=' + (sub.source === 'dmhy' ? 'nyaa' : 'dmhy') + ' kw=' + kwUsed)
+            const bf = rankItems(items, {
+              aliases: sub.aliases.length ? sub.aliases : [kwUsed || base],
+              seasonOnly: sub.season ?? 1,
+              preferResolution: sub.resolution,
+              preferGroup: sub.group,
+            }).filter((c) => c.parsed?.episode !== undefined && want.has(c.parsed.episode) && c.score >= rt.cfg.minMatchScore)
+            const seen = new Set(aiCandidates.map((c) => c.item.magnet))
+            const fresh = bf.filter((c) => !seen.has(c.item.magnet))
+            if (fresh.length) {
+              aiCandidates = [...fresh, ...aiCandidates]
+              dbg('ai-backfill hit sub=' + sub.id + ' eps=' + fresh.map((c) => c.parsed?.episode).join(','))
+              logger.info('bangumi ai-backfill found %d for sub=%s (%s)', fresh.length, sub.id, aiDecided.reason)
+            } else {
+              dbg('ai-backfill miss sub=' + sub.id + ' want=' + aiDecided.backfillEpisodes.join(','))
+            }
+          } catch (err) {
+            logger.warn('bangumi ai-backfill search fail %s: %s', sub.id, err instanceof Error ? err.message : String(err))
+          }
+        }
+        // download-all / search-backfill / null(失败回退) → aiCandidates 保持 windowed 走原逻辑
+      }
+      const dec = decideDownloads({ ...input2, candidates: aiCandidates })
+      dbg('ai-done sub=' + sub.id + ' verdict=' + (aiDecided ? aiDecided.decision : 'null') + ' aiCands=' + aiCandidates.length + ' actions=' + dec.actions.map((a: { episode?: number; why: string; full?: boolean }) => (a.episode ?? (a.full ? 'full' : '?')).toString()).join(',') + ' why=' + dec.actions.map((a: { why: string }) => a.why).join('|').slice(0, 80))
       for (const act of dec.actions) {
         try {
-          const magnet = act.scored.item.magnet
-          if (!magnet) continue
+          const magnet0 = act.scored.item.magnet
+          if (!magnet0) continue
+          // 介入点2：每次下载前 AI 审核（未配置/失败放行；否决则跳过）
+          const gated = await aiApproveDownload(rt, {
+            subName: sub.nameCn || sub.name,
+            bangumiId: sub.bangumiId,
+            episode: act.episode,
+            full: act.full,
+            title: act.scored.item.title,
+            magnet: magnet0,
+            group: act.scored.parsed?.group,
+            resolution: act.scored.parsed?.resolution,
+            score: act.scored.score,
+            haveEpisodes: [...have].sort((a, b) => a - b),
+            totalEpisodes: sub.totalEpisodes,
+          }, logger)
+          if (!gated.ok) {
+            logger.warn('bangumi ai-skip: sub=%s %s (%s)', sub.id, act.why, act.scored.item.title.slice(0, 60))
+            continue
+          }
+          const magnet = gated.magnet
+          const dlTitle = gated.title
           await rt.qb.addMagnet(magnet, {
             savePath: sub.savePath || rt.cfg.qbSavePath || undefined,
             category: sub.category,
@@ -532,9 +706,26 @@ function coreOf(raw: string): string {
   return normalizeTitle(raw)
     .replace(/第?[一二三四五]s*季/g, '')
     .replace(/第?[一二三四五]期/g, '')
-    .replace(/(?:s[2-5]|seasons*[2-5]|parts*[2-5]|2nd|3rd|second|third)/g, '')
+    .replace(/\b(?:s[2-5]|seasons*[2-5]|parts*[2-5]|2nd|3rd|second|third)\b/g, '')
     .replace(/[〜~～].*$/, '')
     .replace(/[（(].*?[）)]/g, '')
+}
+
+/**
+ * 去掉中文名后的英文副标题（含空格分隔/冒号分隔，只对「主名含汉字」生效，纯英文不动）：
+ *   '攻壳机动队 THE GHOST IN THE SHELL' → '攻壳机动队'
+ *   '攻壳机动队 STAND ALONE COMPLEX'    → '攻壳机动队'
+ * 副标也剥季词（如 S.A.C. 2nd GIG / THE MOVIE）以与季判定对齐；末尾残留分隔符一并清理。
+ */
+function stripEnSuffix(base: string): string {
+  let out = base
+  if (/[\u4e00-\u9fff]/.test(out)) {
+    out = out.replace(/[\s·:：-]+[A-Za-z0-9].*$/, '')
+    out = out.replace(/\s*[Ss](?:eason)?\s*(\d+)$/i, '')
+    out = out.replace(/\s*[（(]\s*[Ss](?:eason)?\s*(\d+)\s*[）)]$/i, '')
+  }
+  out = out.replace(/[\s·:：-]+$/, '')
+  return out.trim()
 }
 
 // ---------- 分类/目录布局（番/作品[/第N季]） ----------
@@ -552,10 +743,10 @@ function coreNameOf(sub: { nameCn?: string; name?: string }): string {
     .replace(/[〜~～].*$/, '')
     .replace(/[（(].*?[）)]/g, '')
     .replace(/s*[:：].*$/, '')
-    .replace(/[Ss]([2-9])/g, '')
-    .replace(/(?:Season|Part)s*[2-9]/gi, '')
-    .trim()
-  return stripped || base
+    .replace(/\b[Ss]([2-9])\b/g, '')
+    .replace(/\b(?:Season|Part)s*[2-9]\b/gi, '')
+  const final = stripEnSuffix(stripped) || base
+  return final
 }
 /** 布局目标：{category, savePath}。S1 且同作品无更高季订阅 → 扁平 番/作品；否则 番/作品/第N季 */
 function layoutFor(rt: Runtime, sub: { nameCn?: string; name?: string; season?: number; id?: string }): { category: string; savePath: string; season: number; core: string } {
@@ -577,7 +768,40 @@ function layoutFor(rt: Runtime, sub: { nameCn?: string; name?: string; season?: 
   const savePath = base ? [base, ...parts].join('/') : ''
   return { category, savePath, season, core }
 }
-/** 幂等建分类（qB 自动建父级）；失败仅告警（qB 不可达时订阅仍落库） */
+
+/** 双向包含（别名/标题匹配用；两侧同源清洗后再判） */
+const covers = (a: string, b: string): boolean => {
+  const x = normalizeTitle(stripEnSuffix(a))
+  const y = normalizeTitle(stripEnSuffix(b))
+  return (x.length > 0 && y.length > 0) && (x.includes(y) || y.includes(x))
+}
+
+/** 无 bangumiId 的标题直入布局：先按标题匹配既有订阅（别名/核心），命中 → 复用该订阅的
+ * category/savePath（若标题里出现与订阅季冲突的显式季词，按显式季重算布局）；
+ * 未命中 → 清洗标题（剥组名括号/季词/EN 副标）后 layoutFor。保证「同一部剧分类一致」。 */
+function layoutForTitle(rt: Runtime, title: string): { category: string; savePath: string; season: number; core: string } {
+  const state = getState()
+  // 显式季词优先级最高（先于订阅匹配判定冲突）
+  const explicit = hasSeasonWord(title) ? seasonOf(title) : 0
+  let best: Subscription | undefined
+  let score = -1
+  for (const s of state.subscriptions) {
+    const cands = [s.nameCn, s.name, ...(s.aliases ?? [])].filter(Boolean) as string[]
+    if (cands.some((c) => covers(title, c))) {
+      // 命中的别名越长越可信
+      const len = Math.max(...cands.map((c) => c.length))
+      if (len > score) { score = len; best = s }
+    }
+  }
+  if (best) {
+    const season = explicit || best.season || 1
+    return layoutFor(rt, { nameCn: best.nameCn || best.name, name: best.name, season, id: best.id })
+  }
+  const cleaned = stripEnSuffix(coreOf(title) || title).trim()
+  const season = seasonOf(title)
+  return layoutFor(rt, { nameCn: cleaned || title, name: undefined, season })
+}
+
 async function ensureCategory(rt: Runtime, category: string, savePath: string, logger: { warn: (fmt: string, ...a: unknown[]) => void }): Promise<void> {
   try {
     await rt.qb.createCategory(category, savePath || undefined)
@@ -641,6 +865,81 @@ async function migrateFlatFirstSeason(rt: Runtime, core: string, logger: { warn:
   }
 }
 
+/** 分类一致性巡检（核心名变更/核心名重复/结构升级后调用）：
+ * 对每个订阅重算 layoutFor（核心名变短/季结构变化都可能改目标），需要变化时：
+ *  ① ensureCategory 建目标分类+目录；② qB 侧本订阅 tag 任务迁到新分类/savePath；
+ *  ③ 同 core 的平铺任务（含无 tag 的）经 migrateFlatFirstSeason 归位分层。
+ * 任务迁移成功才覆写订阅行（失败保留旧值 → 下轮重试）。旧分类清空后删除。
+ * S≥2 订阅无条件跑 migrate（行未变也要归位同 core 平铺任务）。
+ */
+async function syncCategoryLayout(rt: Runtime, logger: { warn: (fmt: string, ...a: unknown[]) => void; info: (fmt: string, ...a: unknown[]) => void }): Promise<void> {
+  const state = getState()
+  const base = (rt.cfg.qbBaseDir || '').replace(/\/+$/, '')
+  dbg('sync-cat start subs=' + state.subscriptions.length)
+  const stale: Array<{ category: string }> = []
+  let changedRows = 0
+  for (const s of [...state.subscriptions]) {
+    const lay = layoutFor(rt, s)
+    const needChange = lay.category !== s.category || (!!lay.savePath && lay.savePath !== s.savePath)
+    dbg('sync-cat row ' + s.id + ' old=' + s.category + ' new=' + lay.category + ' need=' + needChange + ' season=' + lay.season + ' core=' + lay.core)
+    let ok = true
+    if (needChange) {
+      await ensureCategory(rt, lay.category, lay.savePath, logger)
+      try {
+        const mine = await rt.qb.torrents({ tag: 'dsh-bangumi-sub-' + s.id })
+        if (mine.length) {
+          const hashes = mine.map((t) => t.hash).join('|')
+          await rt.qb.setTorrentCategory(hashes, lay.category)
+          if (base && lay.savePath) await rt.qb.setTorrentSavePath(hashes, lay.savePath)
+        }
+        stale.push({ category: s.category })
+      } catch (err) {
+        logger.warn('bangumi sync layout qb fail %s: %s', s.id, err instanceof Error ? err.message : String(err))
+        dbg('sync-cat qb fail ' + s.id + ' ' + (err instanceof Error ? err.message : String(err)))
+        ok = false
+      }
+      if (ok) {
+        s.category = lay.category
+        s.savePath = lay.savePath || s.savePath
+        changedRows++
+        dbg('sync-cat updated ' + s.id + ' -> ' + lay.category)
+      }
+    }
+    // S≥2：同 core 平铺任务归位分层（无论本行是否变化）
+    if (ok && lay.season >= 2) {
+      try { await migrateFlatFirstSeason(rt, lay.core, logger) } catch { /* 归位失败下轮重试 */ }
+    }
+  }
+  dbg('sync-cat loop-done changedRows=' + changedRows)
+  if (changedRows) {
+    try { saveState(state); dbg('sync-cat saveState ok') } catch (err) { dbg('sync-cat saveState ERR ' + (err instanceof Error ? err.message : String(err))) }
+  }
+  // 清理空分类（订阅已不引用、qB 无任务、非默认分类）
+  let existing = new Set<string>()
+  try {
+    const all = await rt.qb.categories()
+    existing = new Set(all.map((c) => c.category))
+  } catch { existing = new Set() }
+  const liveCats = new Set<string>()
+  for (const s of getState().subscriptions) liveCats.add(s.category)
+  let removed = 0
+  for (const st of stale) {
+    if (!st.category || st.category === rt.cfg.qbCategory || !existing.has(st.category)) continue
+    if (liveCats.has(st.category)) continue
+    try {
+      const t = await rt.qb.torrents({ category: st.category })
+      if (t.length) continue
+      await rt.qb.deleteCategory(st.category)
+      removed++
+    } catch (err) {
+      logger.warn('bangumi sync layout deleteCategory %s: %s', st.category, err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (removed || changedRows) {
+    logger.info('bangumi category sync: %d row(s) updated, %d empty category(ies) removed', removed, changedRows)
+    dbg('sync-cat done removed=' + removed + ' changed=' + changedRows)
+  }
+}
 async function lookupSubject(keyword: string): Promise<BangumiSubject | null> {
   const kw = String(keyword ?? '').trim()
   if (!kw) return null
@@ -726,7 +1025,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 
 type WebServerRegistration = { kind: 'prefix'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void }
 type WebServerLike = { register: (entry: WebServerRegistration) => () => void }
-type BangumiContext = Context & { webServer: WebServerLike }
+type BangumiContext = Context & { webServer: WebServerLike; llm?: LlmStreamLike }
 
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -741,19 +1040,40 @@ function sendJson(res: ServerResponse, code: number, obj: unknown): void {
   res.end(body)
 }
 
-interface Rt { cfg: Config; qb: QbClient; library: LibrarySnapshot | null; libraryScanning: boolean; resetCaches: boolean }
+/** 宿主 LLM 目录：providers = 已注册路由；models = 指定 provider 的模型列表（失败返回空数组） */
+async function llmModelCatalog(bctx: BangumiContext, provider: string): Promise<{ providers: Array<{ id: string; name: string }>; models: Array<{ id: string; name: string }>; loadingProvider: string }> {
+  try {
+    const llm = bctx.llm as (LlmStreamLike & { listProviders?: () => Array<{ id: string; name: string }>; listModels?: (p: string) => Promise<Array<{ id: string; name: string }>> }) | undefined
+    const providers = (llm?.listProviders?.() ?? []).map((p) => ({ id: p.id, name: p.name || p.id }))
+    let models: Array<{ id: string; name: string }> = []
+    const target = provider || providers[0]?.id || ''
+    if (llm?.listModels && target) {
+      try { models = await llm.listModels(target) } catch { models = [] }
+    }
+    return { providers, models, loadingProvider: target }
+  } catch {
+    return { providers: [], models: [], loadingProvider: '' }
+  }
+}
+
+interface Rt { cfg: Config; qb: QbClient; library: LibrarySnapshot | null; libraryScanning: boolean; resetCaches: boolean; ai: AiReviewer }
 
 export function apply(ctx: Context, config: Config): void {
   const bctx = ctx as unknown as BangumiContext
   const logger = bctx.logger
+  dbg('apply pid=' + process.pid + ' ts=' + Date.now() + ' ai=' + resolveConfig(config).aiProvider + '/' + resolveConfig(config).aiModel)
   const rt: Rt = {
     cfg: resolveConfig(config),
     qb: null as unknown as QbClient,
     library: null,
     libraryScanning: false,
     resetCaches: false,
+    ai: null as unknown as AiReviewer,
   }
   rt.qb = new QbClient({ url: rt.cfg.qbUrl, username: rt.cfg.qbUsername, password: rt.cfg.qbPassword })
+  const aiCfg = (): AiReviewConfig => ({ enabled: rt.cfg.aiEnabled, route: rt.cfg.aiProvider && rt.cfg.aiModel ? { provider: rt.cfg.aiProvider, model: rt.cfg.aiModel } : undefined })
+  dbg('apply llm=' + (bctx.llm ? 'present' : 'MISSING') + ' ai=' + rt.cfg.aiEnabled + ' ' + rt.cfg.aiProvider + '/' + rt.cfg.aiModel)
+  rt.ai = new AiReviewer(bctx.llm ?? (null as unknown as LlmStreamLike), aiCfg, (m) => { logger.warn('%s', m); dbg('ai-log ' + m) })
 
   const reloadRuntime = (): void => {
     rt.cfg = resolveConfig(config)
@@ -790,11 +1110,59 @@ export function apply(ctx: Context, config: Config): void {
     if (rt.libraryScanning) return rt.library ?? { files: [], byTitle: {}, byDir: {}, scannedAt: 0, roots: [] }
     rt.libraryScanning = true
     try {
+      // 扫描前的旧库行（用于 diff 新增；replaceLibrary 后旧数据不可再得）
+      let prevByDir: Record<string, Record<number, unknown>> = {}
+      try {
+        const prevFiles = getDb().loadLibraryFiles()
+        prevByDir = buildByDir(prevFiles, rt.cfg.mediaDirs)
+      } catch { /* 首次扫描无旧数据 */ }
       const snap = await scanLibrary(rt.cfg.mediaDirs)
       rt.library = snap
       rt.resetCaches = false
       // 持久化快照 -> sqlite（启动时据此水合；root 标记用于下次扫描剔除消失目录）
       getDb().replaceLibrary(snap.files, snap.roots, snap.scannedAt)
+      // 介入点3：媒体库更新后 AI 判断（新增文件/变化作品/订阅缺集；未配置跳过）
+      if (rt.ai.enabled) {
+        try {
+          // 变化作品：dirKey 级集号 diff
+          const changedWorks: Array<{ name: string; episodes: number[]; missing?: number[] }> = []
+          for (const [key, eps] of Object.entries(snap.byDir)) {
+            const prevEps = Object.keys(prevByDir[key] ?? {}).map(Number)
+            const added = Object.keys(eps).map(Number).filter((n) => !prevEps.includes(n))
+            if (added.length) changedWorks.push({ name: key, episodes: added.sort((a, b) => a - b) })
+          }
+          // 订阅已放送缺集（只为有变化的作品匹配的订阅拉 episodes，控制成本）
+          const st0 = getState()
+          const subscribedMissing: Array<{ name: string; missing: number[] }> = []
+          if (changedWorks.length) {
+            const today0 = new Date(); today0.setHours(0, 0, 0, 0)
+            for (const sub of st0.subscriptions) {
+              const have = findEpisodesInLibrary(snap, sub.aliases.length ? sub.aliases : [sub.query]).episodes
+              const epsAll0 = await getEpisodesCached(sub.bangumiId).catch(() => [] as Array<{ ep: number; airDate?: string }>)
+              const aired = epsAll0.filter((e) => e.airDate && new Date(e.airDate + 'T00:00:00').getTime() <= today0.getTime()).map((e) => e.ep)
+              const missing = aired.filter((n) => !have.includes(n))
+              if (missing.length) subscribedMissing.push({ name: sub.nameCn || sub.name, missing })
+            }
+          }
+          const note = await rt.ai.reviewLibrary({
+            addedFiles: Math.max(0, snap.files.length - Object.keys(prevByDir).reduce((a, k) => a + Object.keys(prevByDir[k]).length, 0)),
+            changedWorks,
+            subscribedMissing,
+          })
+          if (note) {
+            logger.info('bangumi ai-library: %s', note.note)
+            if (note.notifyMissing) {
+              // AI 判定有订阅缺集需要补 → 立即触发一轮判新下载
+              logger.info('bangumi ai-library notifyMissing → trigger poll')
+              void pollSubscriptions(rt, logger).then((fr) => {
+                if (fr.length) logger.info('bangumi ai-triggered poll downloaded %d', fr.length)
+              }).catch((e) => logger.warn('bangumi ai-triggered poll fail: %s', e instanceof Error ? e.message : String(e)))
+            }
+          }
+        } catch (err) {
+          logger.warn('bangumi ai-library scan note fail: %s', err instanceof Error ? err.message : String(err))
+        }
+      }
       return snap
     } finally {
       rt.libraryScanning = false
@@ -811,7 +1179,13 @@ export function apply(ctx: Context, config: Config): void {
         const route = url.pathname.replace(/^\/api\/bangumi/, '') || '/'
         try {
           if (route === '/settings' && req.method === 'GET') {
-            return sendJson(res, 200, { settings: rt.cfg, file: FILE_CONFIG })
+            const wantModels = url.searchParams.get('models') === '1'
+            const models = wantModels ? await llmModelCatalog(bctx, rt.cfg.aiProvider) : undefined
+            return sendJson(res, 200, { settings: rt.cfg, file: FILE_CONFIG, models })
+          }
+          if (route === '/settings/models' && req.method === 'GET') {
+            const provider = url.searchParams.get('provider') ?? ''
+            return sendJson(res, 200, { models: await llmModelCatalog(bctx, provider) })
           }
           if (route === '/settings' && req.method === 'POST') {
             const body = JSON.parse((await readBody(req)) || '{}')
@@ -858,6 +1232,13 @@ export function apply(ctx: Context, config: Config): void {
             const body = JSON.parse((await readBody(req)) || '{}')
             const sub = await unsubscribeBangumi(rt, String(body.id))
             return sendJson(res, 200, { removed: sub.id })
+          }
+          if (route === '/poll' && req.method === 'POST') {
+            // 手动触发一轮判新轮询（与定时器同链路）：先刷新媒体库快照再 poll
+            const snap = await getLibrary().catch(() => null)
+            if (snap) rt.library = snap
+            const fresh = await pollSubscriptions(rt, logger)
+            return sendJson(res, 200, { at: Date.now(), fetched: fresh })
           }
           if (route === '/search' && req.method === 'GET') {
             const bangumiId = Number(url.searchParams.get('bangumiId') ?? 0)
@@ -1008,14 +1389,36 @@ export function apply(ctx: Context, config: Config): void {
                 } catch { /* 元数据拿不到：退回默认分类 */ }
               }
             } else if (dtitle) {
-              const season = seasonOf(dtitle)
-              const lay = layoutFor(rt, { nameCn: dtitle, season })
+              const lay = layoutForTitle(rt, dtitle)
               cat = lay.category; sp = lay.savePath || rt.cfg.qbSavePath
             }
+            // 确保目标分类与磁盘目录存在（title-only 清洗后可能产生全新分类）
+            if (cat !== rt.cfg.qbCategory) await ensureCategory(rt, cat, sp, logger)
+            // 介入点2：REST 手动下载也走 AI 审核（有番剧归属时；未配置/失败放行）
+            if (bgmId || dtitle) {
+              let libEps: number[] = []
+              try {
+                const snap = await getLibrary()
+                if (snap) {
+                  const found = findEpisodesInLibrary(snap, subRow?.aliases ?? [dtitle])
+                  libEps = found.episodes
+                }
+              } catch { /* 忽略 */ }
+              const gated = await aiApproveDownload(rt, {
+                subName: dtitle || '未知名',
+                bangumiId: bgmId,
+                full: true,
+                title: String(body.title ?? dtitle),
+                magnet: String(body.magnet),
+                score: 0,
+                haveEpisodes: libEps,
+              }, logger)
+              if (!gated.ok) return sendJson(res, 403, { ok: false, error: 'AI 审核未通过（详情见日志）' })
+            }
             await rt.qb.addMagnet(String(body.magnet), { savePath: sp || undefined, category: cat, tags: rt.cfg.qbTags })
-            const state = getState()
-            state.downloads.push({ magnet: String(body.magnet), title: dtitle, bangumiId: bgmId, origin: 'qb', at: Date.now() })
-            saveState(state)
+            const dlState = getState()
+            dlState.downloads.push({ magnet: String(body.magnet), title: dtitle, bangumiId: bgmId, origin: 'qb', at: Date.now() })
+            saveState(dlState)
             return sendJson(res, 200, { ok: true, category: cat, savePath: sp })
           }
           if (route === '/library/posters' && req.method === 'GET') {
@@ -1046,23 +1449,14 @@ export function apply(ctx: Context, config: Config): void {
               g.episodes.push(f.parsed.episode)
               if (g.names.length < 3 && !g.names.includes(f.name)) g.names.push(f.name)
             }
-            // 候选池：订阅（含别名）+ 全部 subject_cache（含过期的，老条目也能当封面）
+            // 候选池：订阅（含别名）+ 全部 subject_cache（含过期的，老条目也能当封面）。
+            // ⚠️ 2026-09-05 修复：订阅行本身不带 images——已订阅作品必须回查 subject_cache
+            // 补封面（根因：尼古喵喵海报 cover 空）。缓存条目先全量建索引再装配候选。
             const state = getState()
             const subByBgmId = new Map<number, Subscription>()
-            const cands: PosterCandidate[] = []
-            for (const sub of state.subscriptions) {
-              subByBgmId.set(sub.bangumiId, sub)
-              cands.push({
-                id: sub.bangumiId,
-                aliases: sub.aliases.length ? sub.aliases : [sub.name, sub.nameCn].filter(Boolean),
-                name: sub.name,
-                nameCn: sub.nameCn,
-                airDate: sub.airDate,
-                totalEpisodes: sub.totalEpisodes,
-              })
-            }
+            const cachedById = new Map<number, PosterCandidate>()
             for (const c of getDb().listSubjectCacheAll()) {
-              if (!subByBgmId.has(c.id)) cands.push({
+              cachedById.set(c.id, {
                 id: c.id,
                 aliases: c.aliases.length ? c.aliases : [c.subject.name, c.subject.nameCn].filter(Boolean),
                 name: c.subject.name,
@@ -1073,6 +1467,25 @@ export function apply(ctx: Context, config: Config): void {
                 platform: c.subject.platform,
                 summary: c.subject.summary,
               })
+            }
+            const cands: PosterCandidate[] = []
+            for (const sub of state.subscriptions) {
+              subByBgmId.set(sub.bangumiId, sub)
+              const cc = cachedById.get(sub.bangumiId)
+              cands.push({
+                id: sub.bangumiId,
+                aliases: sub.aliases.length ? sub.aliases : [sub.name, sub.nameCn].filter(Boolean),
+                name: sub.name,
+                nameCn: sub.nameCn,
+                airDate: sub.airDate,
+                totalEpisodes: sub.totalEpisodes,
+                images: cc?.images,
+                platform: cc?.platform,
+                summary: cc?.summary,
+              })
+            }
+            for (const [cid, cc] of cachedById) {
+              if (!subByBgmId.has(cid)) cands.push(cc)
             }
             const posters: Array<{
               key: string
@@ -1195,23 +1608,42 @@ export function apply(ctx: Context, config: Config): void {
             return sendJson(res, 200, { files: snap.files.length, titles: Object.keys(snap.byTitle).length, scannedAt: snap.scannedAt })
           }
           if (route === '/calendar' && req.method === 'GET') {
+            // ⚠️ 2026-09-05 修复：弃用「(日期-首播)/7+1」周推算——首日多集连播（穹庐/无职 EP1+2 同 7/4）会让
+            // 整季滞后一集（9/5 真 EP11 被算成 EP10）。改铺 episodes 表真实 airDate（bgm 权威放送日）。
             const year = Number(url.searchParams.get('year')) || new Date().getFullYear()
             const month = Number(url.searchParams.get('month')) || new Date().getMonth() + 1
             const state = getState()
             const days = new Date(year, month, 0).getDate()
             const calendar: Array<{ date: string; items: Array<{ name: string; nameCn: string; episode: number | null }> }> = []
+            // 每订阅一次性拉 episodes 表 → date→ep 映射（缓存 6h；失败回退估算）
+            const perSubEps: Array<{ sub: (typeof state.subscriptions)[number]; map: Map<string, number> }> = []
+            for (const sub of state.subscriptions) {
+              let map = new Map<string, number>()
+              try {
+                const eps = await getEpisodesCached(sub.bangumiId).catch(() => [] as Array<{ ep: number; airDate?: string }>)
+                for (const e of eps) if (e.airDate) map.set(e.airDate, e.ep)
+              } catch { /* keep empty */ }
+              perSubEps.push({ sub, map })
+            }
             for (let d = 1; d <= days; d += 1) {
-              const date = new Date(year, month - 1, d)
               const iso = year + '-' + String(month).padStart(2, '0') + '-' + String(d).padStart(2, '0')
               const items: Array<{ name: string; nameCn: string; episode: number | null }> = []
-              for (const sub of state.subscriptions) {
-                if (sub.weekday === undefined || date.getDay() !== sub.weekday) continue
+              for (const { sub, map } of perSubEps) {
                 let ep: number | null = null
-                if (sub.airDate) {
-                  const first = new Date(sub.airDate + 'T00:00:00')
-                  const est = date >= first ? Math.floor((date.getTime() - first.getTime()) / (7 * 86400_000)) + 1 : null
-                  // 已在播的集数估算；超过总集数说明番已完结，不再逐周铺点
-                  if (est !== null && (sub.totalEpisodes === undefined || est <= sub.totalEpisodes)) ep = est
+                const known = map.get(iso)
+                if (known !== undefined) {
+                  ep = known
+                } else if (map.size > 0 && sub.airDate) {
+                  // 无精确 airdate 的日期不铺点（避免周末错位猜集号）
+                  continue
+                } else {
+                  // episodes 拉不到（异常）→ 兜底原周推算
+                  const date = new Date(year, month - 1, d)
+                  if (sub.weekday !== undefined && date.getDay() === sub.weekday && sub.airDate) {
+                    const first = new Date(sub.airDate + 'T00:00:00')
+                    const est = date >= first ? Math.floor((date.getTime() - first.getTime()) / (7 * 86400_000)) + 1 : null
+                    if (est !== null && (sub.totalEpisodes === undefined || est <= sub.totalEpisodes)) ep = est
+                  }
                 }
                 if (ep !== null) items.push({ name: sub.name, nameCn: sub.nameCn, episode: ep })
               }
@@ -1501,9 +1933,31 @@ export function apply(ctx: Context, config: Config): void {
             cat = lay.category; sp = lay.savePath || rt.cfg.qbSavePath
           } catch { /* 元数据失败：退回默认 */ }
         } else if (dtitle) {
-          const season = seasonOf(dtitle)
-          const lay = layoutFor(rt, { nameCn: dtitle, season })
+          const lay = layoutForTitle(rt, dtitle)
           cat = lay.category; sp = lay.savePath || rt.cfg.qbSavePath
+        }
+        // 确保目标分类与磁盘目录存在
+        if (cat !== rt.cfg.qbCategory) await ensureCategory(rt, cat, sp, logger)
+        // 介入点2：手动加磁链也走 AI 审核（有番剧归属时；未配置/失败放行）
+        if (args.bangumiId || dtitle) {
+          let libEps: number[] = []
+          try {
+            const snap = await getLibrary()
+            if (snap && dtitle) {
+              const found = findEpisodesInLibrary(snap, [dtitle])
+              libEps = found.episodes
+            }
+          } catch { /* 忽略 */ }
+          const gated = await aiApproveDownload(rt, {
+            subName: dtitle || '未知名',
+            bangumiId: args.bangumiId,
+            full: true,
+            title: args.title ?? args.magnet.slice(0, 40),
+            magnet: args.magnet,
+            score: 0,
+            haveEpisodes: libEps,
+          }, logger)
+          if (!gated.ok) return 'AI 审核未通过，已取消下载（详情见日志）。'
         }
         await rt.qb.addMagnet(args.magnet, { savePath: sp || undefined, category: cat, tags: rt.cfg.qbTags })
         const state = getState()
@@ -1536,6 +1990,12 @@ export function apply(ctx: Context, config: Config): void {
         if (!cleanedLegacy) {
           cleanedLegacy = true
           await cleanupLegacyRss(rt, logger)
+          // 分类一致性巡检：核心名变更后把订阅/qB 任务迁到短名分类（幂等；失败留待下轮）
+          dbg('sync-cat invoke from tick')
+          try { await syncCategoryLayout(rt, logger) } catch (err) {
+            logger.warn('bangumi category sync fail: %s', err instanceof Error ? err.message : String(err))
+            dbg('sync-cat ERROR ' + (err instanceof Error ? err.message : String(err)))
+          }
         }
         const fresh = await pollSubscriptions(rt, logger)
         if (fresh.length) {

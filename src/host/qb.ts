@@ -156,6 +156,23 @@ export class QbClient {
     if (!res.ok && res.status !== 409) throw new Error('qB createCategory HTTP ' + res.status)
   }
 
+  /** 现存分类清单（{category, savePath}，qB 返回含子分类） */
+  async categories(): Promise<Array<{ category: string; savePath: string }>> {
+    if (!this.cookie) await this.login()
+    const res = await this.req('/api/v2/torrents/categories', undefined, 'GET')
+    if (!res.ok) throw new Error('qB categories HTTP ' + res.status)
+    const data = (await res.json()) as Record<string, { savePath?: string }>
+    return Object.entries(data).map(([category, v]) => ({ category, savePath: v.savePath || '' }))
+  }
+
+  /** 删除空分类（qB 要求分类下无任务，否则 409） */
+  async deleteCategory(category: string): Promise<void> {
+    if (!this.cookie) await this.login()
+    // qB v5.2.2 实测：/torrents/deleteCategory 不存在；removeCategories?categories= 可用
+    const res = await this.req('/api/v2/torrents/removeCategories', { categories: category })
+    if (!res.ok && res.status !== 409 && res.status !== 404) throw new Error('qB deleteCategory HTTP ' + res.status)
+  }
+
   /** 修改单个任务分类 */
   async setTorrentCategory(hashes: string, category: string): Promise<void> {
     if (!this.cookie) await this.login()
@@ -166,7 +183,8 @@ export class QbClient {
   /** 修改任务保存路径（contentLayout=Original 保留结构） */
   async setTorrentSavePath(hashes: string, savePath: string): Promise<void> {
     if (!this.cookie) await this.login()
-    const res = await this.req('/api/v2/torrents/setSavePath', { hashes, savePath })
-    if (!res.ok && res.status !== 409) throw new Error('qB setSavePath HTTP ' + res.status)
+    // qB v4: hashes+savePath；qB v5: id+path。双发兼容；成功条件放宽到 200/409
+    const res = await this.req('/api/v2/torrents/setSavePath', { hashes, savePath, id: hashes, path: savePath })
+    if (!res.ok && res.status !== 409) throw new Error('qB setSavePath HTTP ' + res.status + ' ' + (await res.text().catch(() => '')))
   }
 }
