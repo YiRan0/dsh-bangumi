@@ -28,18 +28,13 @@ export interface BangumiEpisode {
 const BASE = 'https://api.bgm.tv'
 
 async function apiGet(path: string): Promise<any> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 15000)
-  try {
-    const res = await fetch(BASE + path, {
-      signal: ctrl.signal,
-      headers: { 'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)' },
-    })
-    if (!res.ok) throw new Error('bangumi ' + res.status + ' ' + res.statusText)
-    return await res.json()
-  } finally {
-    clearTimeout(timer)
-  }
+  const { netFetch } = await import('./net.js')
+  const res = await netFetch(BASE + path, {
+    timeoutMs: 15000,
+    headers: { 'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)' },
+  })
+  if (!res.ok) throw new Error('bangumi ' + res.status + ' ' + res.statusText)
+  return res.json()
 }
 
 function toSubject(raw: any): BangumiSubject {
@@ -76,25 +71,20 @@ function toSubject(raw: any): BangumiSubject {
 
 /** 番剧搜索：POST /search/subjects，type=2（动画） */
 export async function searchSubjects(keyword: string, limit = 10): Promise<BangumiSubject[]> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 20000)
-  try {
-    const res = await fetch(BASE + '/v0/search/subjects?limit=' + limit, {
-      method: 'POST',
-      signal: ctrl.signal,
-      headers: {
-        'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ keyword, filter: { type: [2] } }),
-    })
-    if (!res.ok) throw new Error('bangumi search ' + res.status)
-    const data: any = await res.json()
-    const list: any[] = data?.data ?? data?.list ?? []
-    return list.map(toSubject)
-  } finally {
-    clearTimeout(timer)
-  }
+  const { netFetch } = await import('./net.js')
+  const res = await netFetch(BASE + '/v0/search/subjects?limit=' + limit, {
+    method: 'POST',
+    timeoutMs: 20000,
+    headers: {
+      'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ keyword, filter: { type: [2] } }),
+  })
+  if (!res.ok) throw new Error('bangumi search ' + res.status)
+  const data: any = await res.json()
+  const list: any[] = data?.data ?? data?.list ?? []
+  return list.map(toSubject)
 }
 
 /** 番剧详情 */

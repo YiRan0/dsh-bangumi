@@ -33,6 +33,11 @@ const zh = {
   subscribe: '订阅', subscribeTo: '去检索订阅', inLibrary: '库中集数', noSummary: '暂无简介',
   aiBox: 'AI 判新（强介入）', aiEnabled: '启用 AI 判新', aiProvider: '模型供应商', aiModel: '模型',
   aiNone: '（未启用）', aiLoadingModels: '加载模型…', aiNote: '每轮判新 / 下载 / 媒体库扫描由 AI 把关；调用失败自动回退纯脚本。',
+  proxyBox: '网络代理（外网请求出口）', proxyType: '代理类型', proxyNone: '不使用（直连）',
+  proxyHttp: 'HTTP', proxyHttps: 'HTTPS', proxySocks5: 'SOCKS5',
+  proxyHost: '代理主机', proxyPort: '代理端口', proxyUser: '用户名（可选）', proxyPass: '密码（可选）',
+  proxyTest: '测试代理', proxyTesting: '测试中…', proxyOk: '代理可用', proxyBad: '代理不可用',
+  proxyNote: '影响 RSS 抓取 / 番剧检索 / 封面拉取等外网请求；qBittorrent（本机）不受影响。',
 }
 
 
@@ -55,6 +60,11 @@ const en: Dict = {
   subscribe: 'Subscribe', subscribeTo: 'Subscribe via Search', inLibrary: 'In library', noSummary: 'No summary',
   aiBox: 'AI gate (strong)', aiEnabled: 'Enable AI judging', aiProvider: 'Provider', aiModel: 'Model',
   aiNone: '(disabled)', aiLoadingModels: 'Loading models…', aiNote: 'AI reviews each poll / download / library scan; falls back to script on failure.',
+  proxyBox: 'Network proxy (outbound requests)', proxyType: 'Proxy type', proxyNone: 'None (direct)',
+  proxyHttp: 'HTTP', proxyHttps: 'HTTPS', proxySocks5: 'SOCKS5',
+  proxyHost: 'Proxy host', proxyPort: 'Proxy port', proxyUser: 'Username (optional)', proxyPass: 'Password (optional)',
+  proxyTest: 'Test proxy', proxyTesting: 'Testing…', proxyOk: 'Proxy OK', proxyBad: 'Proxy failed',
+  proxyNote: 'Applies to RSS / search / covers etc. qBittorrent (local) is unaffected.',
 }
 
 
@@ -443,6 +453,7 @@ function SettingsTab(): React.ReactElement {
   /* 媒体库目录文本框持有原文（不做逐键过滤/去空行）——否则行尾回车会因
    * 空行被 filter(Boolean) 剔掉而被瞬时复位，导致永远无法新起一行添加目录。 */
   const [dirsText, setDirsText] = React.useState('')
+  const [proxyTest, setProxyTest] = React.useState<{ running?: boolean; ok?: boolean; ms?: number; status?: number; error?: string } | null>(null)
   const [providers, setProviders] = React.useState<Array<{ id: string; name: string }> | null>(null)
   const [models, setModels] = React.useState<Array<{ id: string; name: string }>>([])
   const [modelsProvider, setModelsProvider] = React.useState('')
@@ -520,6 +531,54 @@ function SettingsTab(): React.ReactElement {
     qb ? h('div', { className: 'bg_rowSub', style: { marginTop: '10px' } },
       t.qbStatus + ': ' + (qb.ok ? 'OK (' + (qb.version ?? '?') + ')' : '✕ ' + (qb.error ?? 'fail')),
     ) : null,
+    /* ---- 网络代理（外网出口）设置 ---- */
+    h('div', { className: 'bg_aiBox' },
+      h('h4', null, t.proxyBox),
+      h('div', { className: 'bg_aiRow' },
+        h('span', { className: 'bg_label' }, t.proxyType),
+        h('select', {
+          className: 'bg_select',
+          value: cfg.proxyType || 'none',
+          onChange: (e: any) => update('proxyType', e.target.value),
+        },
+          ['none', 'http', 'https', 'socks5'].map((v) =>
+            h('option', { key: v, value: v },
+              v === 'none' ? t.proxyNone : v === 'http' ? t.proxyHttp : v === 'https' ? t.proxyHttps : t.proxySocks5,
+            ),
+          ),
+        ),
+      ),
+      cfg.proxyType && cfg.proxyType !== 'none'
+        ? h('div', { className: 'bg_grid' },
+            field(t.proxyHost, 'proxyHost'),
+            field(t.proxyPort, 'proxyPort', 'number'),
+            field(t.proxyUser, 'proxyUsername'),
+            field(t.proxyPass, 'proxyPassword', 'password'),
+          )
+        : null,
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+        h('button', {
+          className: 'bg_btn', disabled: !!proxyTest?.running || (cfg.proxyType || 'none') === 'none',
+          onClick: () => {
+            setProxyTest({ running: true })
+            void api.get('/proxy/test').then((r) => {
+              setProxyTest({ ok: r.ok, ms: r.ms, status: r.status, error: r.error })
+            }).catch((e: any) => setProxyTest({ ok: false, error: String(e.message ?? e) }))
+          },
+        }, proxyTest?.running ? t.proxyTesting : t.proxyTest),
+        proxyTest && !proxyTest.running
+          ? h('span', {
+              className: proxyTest.ok ? 'bg_chip local' : 'bg_chip',
+              style: proxyTest.ok ? undefined : { color: '#b00020' },
+            },
+              proxyTest.ok
+                ? t.proxyOk + (proxyTest.ms != null ? ' (' + proxyTest.ms + 'ms)' : '')
+                : t.proxyBad + (proxyTest.error ? ': ' + proxyTest.error : ''),
+            )
+          : null,
+      ),
+      h('div', { className: 'bg_aiNote' }, t.proxyNote),
+    ),
     /* ---- AI 判新（强介入）设置 ---- */
     providers === null ? null : h('div', { className: 'bg_aiBox' },
       h('h4', null, t.aiBox),

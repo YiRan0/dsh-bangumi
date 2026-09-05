@@ -14,6 +14,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 
 import { getEpisodesCached, getSubjectCached, searchSubjects, type BangumiSubject } from './host/bangumi.js'
+import { configureNet, getNetConfig, netFetch, netFetchText, parseProxyUrl, type NetRequestInit, type NetResponse, type ProxyConfig } from './host/net.js'
 import { subjectCardHtml } from './host/card.js'
 import { scanLibrary, buildByTitle, buildByDir, findEpisodesInLibrary, findBestCandidate, type LibrarySnapshot, type PosterCandidate } from './host/library.js'
 import { getDb } from './host/db.js'
@@ -58,6 +59,16 @@ export interface Config {
   /** AI 路由（provider/model；后台无会话，必须显式指定，如 deepseek-official/deepseek-chat） */
   aiProvider: string
   aiModel: string
+  /** 代理类型：none=直连（默认）；http/https/socks5 走设置页手动配置的出口 */
+  proxyType: string
+  /** 代理主机 */
+  proxyHost: string
+  /** 代理端口 */
+  proxyPort: number
+  /** 代理用户名（可选） */
+  proxyUsername: string
+  /** 代理密码（可选） */
+  proxyPassword: string
 }
 
 export const Config = z.object({
@@ -78,6 +89,11 @@ export const Config = z.object({
   aiEnabled: z.boolean().default(false),
   aiProvider: z.string().default(''),
   aiModel: z.string().default(''),
+  proxyType: z.union([z.const('none'), z.const('http'), z.const('https'), z.const('socks5')]).default('none'),
+  proxyHost: z.string().default(''),
+  proxyPort: z.number().default(0),
+  proxyUsername: z.string().default(''),
+  proxyPassword: z.string().default(''),
 })
 
 const FILE_CONFIG = join(homedir(), '.dsh', 'dsh-bangumi.json')
@@ -96,6 +112,11 @@ function loadFileConfig(): Partial<Config> {
     if (typeof obj.aiEnabled === 'boolean') out.aiEnabled = obj.aiEnabled
     if (typeof obj.aiProvider === 'string') out.aiProvider = obj.aiProvider
     if (typeof obj.aiModel === 'string') out.aiModel = obj.aiModel
+    if (obj.proxyType === 'http' || obj.proxyType === 'https' || obj.proxyType === 'socks5' || obj.proxyType === 'none') out.proxyType = obj.proxyType
+    if (typeof obj.proxyHost === 'string') out.proxyHost = obj.proxyHost
+    if (typeof obj.proxyPort === 'number') out.proxyPort = obj.proxyPort
+    if (typeof obj.proxyUsername === 'string') out.proxyUsername = obj.proxyUsername
+    if (typeof obj.proxyPassword === 'string') out.proxyPassword = obj.proxyPassword
     return out
   } catch {
     return {}
@@ -121,6 +142,22 @@ function resolveConfig(config: Config): Config {
     aiEnabled: file.aiEnabled ?? config.aiEnabled,
     aiProvider: env.DSH_BANGUMI_AI_PROVIDER ?? file.aiProvider ?? config.aiProvider,
     aiModel: env.DSH_BANGUMI_AI_MODEL ?? file.aiModel ?? config.aiModel,
+    proxyType: env.DSH_BANGUMI_PROXY_TYPE ?? file.proxyType ?? config.proxyType,
+    proxyHost: env.DSH_BANGUMI_PROXY_HOST ?? file.proxyHost ?? config.proxyHost,
+    proxyPort: Number(env.DSH_BANGUMI_PROXY_PORT ?? '') || (file.proxyPort ?? config.proxyPort),
+    proxyUsername: env.DSH_BANGUMI_PROXY_USER ?? file.proxyUsername ?? config.proxyUsername,
+    proxyPassword: env.DSH_BANGUMI_PROXY_PASS ?? file.proxyPassword ?? config.proxyPassword,
+  }
+}
+
+/** 把运行时 cfg 归一为 ProxyConfig */
+function cfgProxy(cfg: Config): ProxyConfig {
+  return {
+    type: cfg.proxyType === 'http' || cfg.proxyType === 'https' || cfg.proxyType === 'socks5' ? cfg.proxyType : 'none',
+    host: cfg.proxyHost ?? '',
+    port: Number(cfg.proxyPort) || 0,
+    username: cfg.proxyUsername ?? '',
+    password: cfg.proxyPassword ?? '',
   }
 }
 
@@ -1071,6 +1108,8 @@ export function apply(ctx: Context, config: Config): void {
     ai: null as unknown as AiReviewer,
   }
   rt.qb = new QbClient({ url: rt.cfg.qbUrl, username: rt.cfg.qbUsername, password: rt.cfg.qbPassword })
+  configureNet(cfgProxy(rt.cfg))
+  dbg('net proxy=' + rt.cfg.proxyType + ' ' + (rt.cfg.proxyHost || '-') + ':' + (rt.cfg.proxyPort || 0))
   const aiCfg = (): AiReviewConfig => ({ enabled: rt.cfg.aiEnabled, route: rt.cfg.aiProvider && rt.cfg.aiModel ? { provider: rt.cfg.aiProvider, model: rt.cfg.aiModel } : undefined })
   dbg('apply llm=' + (bctx.llm ? 'present' : 'MISSING') + ' ai=' + rt.cfg.aiEnabled + ' ' + rt.cfg.aiProvider + '/' + rt.cfg.aiModel)
   rt.ai = new AiReviewer(bctx.llm ?? (null as unknown as LlmStreamLike), aiCfg, (m) => { logger.warn('%s', m); dbg('ai-log ' + m) })
@@ -1078,6 +1117,8 @@ export function apply(ctx: Context, config: Config): void {
   const reloadRuntime = (): void => {
     rt.cfg = resolveConfig(config)
     rt.qb = new QbClient({ url: rt.cfg.qbUrl, username: rt.cfg.qbUsername, password: rt.cfg.qbPassword })
+    configureNet(cfgProxy(rt.cfg))
+    dbg('net reload proxy=' + rt.cfg.proxyType + ' ' + (rt.cfg.proxyHost || '-') + ':' + (rt.cfg.proxyPort || 0))
     // 媒体库快照以 db 为权威：设置变更后丢弃内存壳，下次按需从 db 水合
     rt.library = null
     rt.resetCaches = true
@@ -1200,6 +1241,26 @@ export function apply(ctx: Context, config: Config): void {
           if (route === '/qb/status') {
             return sendJson(res, 200, await rt.qb.test())
           }
+          if (route === '/proxy/test' && req.method === 'GET') {
+            // 代理连通性测试：GET 一个外网端点（bgm.tv 或默认 https://www.gstatic.com/generate_204）
+            // 走当前运行时代理配置（configureNet 后的 current），测的是已生效出口而非草稿值
+            const url0 = url.searchParams.get('url') || 'https://www.gstatic.com/generate_204'
+            const t0 = Date.now()
+            try {
+              const cfg0 = getNetConfig()
+              const pr = cfg0 ? cfg0.type + '://' + cfg0.host + ':' + cfg0.port + (cfg0.username ? ' (auth)' : '') : '(direct)'
+              const res0 = await netFetch(url0, { timeoutMs: 10000, headers: { 'User-Agent': 'dsh-bangumi-proxy-test/1' } })
+              return sendJson(res, 200, {
+                ok: res0.ok,
+                status: res0.status,
+                ms: Date.now() - t0,
+                url: url0,
+                via: pr,
+              })
+            } catch (err) {
+              return sendJson(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err), via: '(runtime)', ms: Date.now() - t0, url: url0 })
+            }
+          }
           if (route === '/subscriptions' && req.method === 'GET') {
             await getLibrary()
             const state = getState()
@@ -1309,9 +1370,8 @@ export function apply(ctx: Context, config: Config): void {
               // 直接补发字节并回写缓存，卡片无感自愈。
               let effTarget = target
               let effSid = sid
-              let preflight = await fetch(target, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 dsh-bangumi-cover' } })
+              let preflight = await netFetch(target, { timeoutMs: 15000, headers: { 'User-Agent': 'Mozilla/5.0 dsh-bangumi-cover' } })
               if (preflight.status === 404) {
-                preflight.body?.cancel().catch(() => {})
                 let freshUrl = ''
                 try {
                   const { getSubject } = await import('./host/bangumi.js')
@@ -1326,7 +1386,7 @@ export function apply(ctx: Context, config: Config): void {
                 if (freshUrl && freshUrl !== target && /^(https?:\/\/(?:lain|mirror|bangumi)[^/]*\/)/.test(freshUrl)) {
                   effTarget = freshUrl
                   effSid = Number((/\/(\d+)_/.exec(freshUrl) ?? [])[1] ?? 0) || effSid
-                  preflight = await fetch(freshUrl, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 dsh-bangumi-cover' } })
+                  preflight = await netFetch(freshUrl, { timeoutMs: 15000, headers: { 'User-Agent': 'Mozilla/5.0 dsh-bangumi-cover' } })
                 }
               }
               const up = preflight
@@ -1336,11 +1396,11 @@ export function apply(ctx: Context, config: Config): void {
               if (effSid && buf.length <= 1_048_576) {
                 try {
                   const { getDb } = await import('./host/db.js')
-                  getDb().putSubjectCover(effSid, effTarget, new Uint8Array(buf), up.headers.get('content-type') || 'image/jpeg')
+                  getDb().putSubjectCover(effSid, effTarget, new Uint8Array(buf), up.headers['content-type'] || 'image/jpeg')
                 } catch { /* 落库失败不影响出图 */ }
               }
               res.writeHead(200, {
-                'content-type': up.headers.get('content-type') || 'image/jpeg',
+                'content-type': up.headers['content-type'] || 'image/jpeg',
                 'cache-control': 'public, max-age=86400',
                 'content-length': buf.length,
               })

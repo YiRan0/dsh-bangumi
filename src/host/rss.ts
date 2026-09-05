@@ -3,6 +3,7 @@
  * 无第三方依赖：手写轻量 XML/RSS 解析，容忍两个站的真实 RSS 变体。
  */
 import { parseEpisode, type ParsedEpisode } from './parse.js'
+import { netFetchText } from './net.js'
 
 export interface RssItem {
   /** 种子发布组标题（含 [组][番][集][画质]） */
@@ -88,23 +89,15 @@ export function parseRss(xml: string): RssItem[] {
 }
 
 /** 通用 fetch（UA + 超时） */
+/** 通用文本拉取（UA + 超时；外网走可配置代理出口 net.ts，qB 等本机服务不受影响） */
 export async function fetchText(url: string, timeoutMs = 15000): Promise<string> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-  try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: {
-        'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)',
-        'Accept': 'application/rss+xml, text/xml, text/html;q=0.8',
-      },
-      redirect: 'follow',
-    })
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText)
-    return await res.text()
-  } finally {
-    clearTimeout(timer)
-  }
+  return netFetchText(url, {
+    timeoutMs,
+    headers: {
+      'User-Agent': 'dsh-bangumi/0.1 (+https://github.com/dsh-external/dsh-bangumi)',
+      'Accept': 'application/rss+xml, text/xml, text/html;q=0.8',
+    },
+  })
 }
 
 /** nyaa 搜索 RSS */

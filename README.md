@@ -41,6 +41,7 @@
 - **qBittorrent 集成**：自动套分类（默认 `bangumi`）/标签/保存目录，番剧按「分类根/作品[/第N季]」分层归类；分类名自动取简短核心名（剥英文副标，如 `攻壳机动队 THE GHOST IN THE SHELL` → `攻壳机动队`），启动巡检保证同剧各入口（订阅/手动下载/工具）归类一致并迁移旧长名任务；整包下载后自动停止订阅跟踪
 - **本地媒体库**：目录扫描建索引，按标题别名 + 目录名双向匹配集数，进度聚合（已下载/总集数/缺集）
 - **AI 强介入审核**（可选）：轮询判新 / 手动下载 / 媒体库扫描三介入点由 LLM 裁决（hold/search-backfill/放行），失败自动回退脚本原逻辑，不阻塞下载
+- **可配置网络代理**（可选）：设置页手动配置 HTTP / HTTPS / SOCKS5 出口（支持用户名密码认证），作用于 RSS 抓取 / 番剧检索 / 封面拉取等全部外网请求；qBittorrent 等本机服务不受影响。内置连通性测试按钮，未配置时与原生直连行为一致
 - **封面本地缓存**：sqlite cover_cache 落库（URL 变更自动过期、404 自愈重取），断网可显、零重复外网拉取
 - **LLM 工具集**：`bangumi_lookup`（唯一 HTML 资料卡）/ `bangumi_search` / `bangumi_subscribe` / `bangumi_unsubscribe` / `bangumi_list` / `bangumi_progress` / `bangumi_calendar` / `qb_status` / `qb_configure` / `qb_add_torrent` / `library_scan`
 - **侧边栏独立页 GUI**：订阅列表（进度条+缺集）、追番日历、搜索页、设置页——DOM 面板形态（`data-dsh-bangumi-entry`），与 taskboard/ssh/mnemon 互斥激活
@@ -56,6 +57,7 @@ src/
 │   ├── parse.ts      标题归一 / 集号解析 / 整包识别（multiSeason/seasonFull/rangeRaw）
 │   ├── match.ts      种子打分排序（别名/集号/分辨率/组/seeders/整包）
 │   ├── decision.ts   下载决策纯函数（finished→全集优先，airing→只补缺集）
+│   ├── net.ts        可配置代理网络层（http/https/socks5，纯 Node 原生，零依赖）
 │   ├── ai-review.ts  AI 审核层（llm.stream 流式裁决，失败回退原逻辑）
 │   ├── qb.ts          qBittorrent 客户端（401 重登 cookie、RSS 规则、分类）
 │   ├── library.ts     媒体库扫描 + byTitle/byDir 索引
