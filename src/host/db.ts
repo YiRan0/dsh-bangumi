@@ -97,7 +97,15 @@ CREATE TABLE IF NOT EXISTS cover_cache (
   bytes BLOB NOT NULL,
   content_type TEXT,
   saved_at INTEGER NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS activity_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  level TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_log_ts ON activity_log(ts DESC);`
 
 type Row = Record<string, any>
 
@@ -238,14 +246,27 @@ class BangumiDb {
     }
     return out
   }
-  getEpisodesCache(subjectId: number): { episodes: BangumiEpisode[]; savedAt: number } | null {
+  getEpisodesCache(subjectId: number, allowStale = false): { episodes: BangumiEpisode[]; savedAt: number; stale: boolean } | null {
     const row = this.db.prepare('SELECT payload, saved_at FROM episodes_cache WHERE subject_id = ?').get(subjectId) as Row | undefined
     if (!row) return null
-    if (Date.now() - Number(row.saved_at) > EPISODES_TTL_MS) return null
+    const stale = Date.now() - Number(row.saved_at) > EPISODES_TTL_MS
+    if (stale && !allowStale) return null
     try {
-      return { episodes: JSON.parse(row.payload), savedAt: Number(row.saved_at) }
+      return { episodes: JSON.parse(row.payload), savedAt: Number(row.saved_at), stale }
     } catch { return null }
   }
+  // ---------- 活动日记 ----------
+  addLog(level: 'info' | 'warn' | 'error', tag: string, message: string): void {
+    try {
+      this.db.prepare('INSERT INTO activity_log (ts,level,tag,message) VALUES (?,?,?,?)').run(Date.now(), level, tag, message.slice(0, 500))
+      this.db.prepare('DELETE FROM activity_log WHERE id NOT IN (SELECT id FROM activity_log ORDER BY id DESC LIMIT 500)').run()
+    } catch { /* 日志绝不能把主流程拖挂 */ }
+  }
+  listLogs(limit = 200): Array<{ id: number; ts: number; level: string; tag: string; message: string }> {
+    return this.db.prepare('SELECT id,ts,level,tag,message FROM activity_log ORDER BY id DESC LIMIT ?').all(limit) as any
+  }
+  clearLogs(): void { try { this.db.exec('DELETE FROM activity_log') } catch { /* ok */ } }
+
   setEpisodesCache(subjectId: number, episodes: BangumiEpisode[]): void {
     this.db.prepare('INSERT OR REPLACE INTO episodes_cache (subject_id,payload,saved_at) VALUES (?,?,?)').run(subjectId, JSON.stringify(episodes), Date.now())
   }
@@ -362,5 +383,9 @@ export function getDb(): BangumiDb {
     migrateLegacy(instance)
   }
   return instance
+}
+/** 活动日记：插件全链路动作/错误的持久化记录（UI「日记」Tab 展示） */
+export function logActivity(level: 'info' | 'warn' | 'error', tag: string, message: string): void {
+  try { getDb().addLog(level, tag, message) } catch { /* 初始化期可静默 */ }
 }
 export type { BangumiDb }

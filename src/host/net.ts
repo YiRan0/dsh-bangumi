@@ -286,6 +286,7 @@ export async function netFetch(url: string, init: NetRequestInit = {}, proxyOver
 
   const ctrl = new AbortController()
   const timer = setTimeout(() => { ctrl.abort(new Error('timeout after ' + timeoutMs + 'ms')) }, timeoutMs)
+  let settled = false // 拿到响应头即视为完成：socket 必须存活供调用方惰性读 body
   try {
     let socket: Socket
     try {
@@ -295,10 +296,13 @@ export async function netFetch(url: string, init: NetRequestInit = {}, proxyOver
     } catch (e) {
       throw new Error('proxy(' + proxy.type + ' ' + proxy.host + ':' + proxy.port + ') connect ' + target.hostname + ':' + targetPort + ' failed: ' + (e instanceof Error ? e.message : String(e)))
     }
-    return await tunneledRequest(socket, targetTls, target, method, headers, body, ctrl.signal)
+    const out = await tunneledRequest(socket, targetTls, target, method, headers, body, ctrl.signal)
+    settled = true
+    return out
   } finally {
     clearTimeout(timer)
-    ctrl.abort()
+    // 只能在响应未交付时 abort；响应已 resolve 后 abort 会销毁仍在被 collectBody 读取的 socket，把完整响应变成 Error('aborted')
+    if (!settled) ctrl.abort()
   }
 }
 

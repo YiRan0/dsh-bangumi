@@ -111,10 +111,16 @@ export async function getSubjectCached(id: number): Promise<{ subject: BangumiSu
   const { getDb } = await import('./db.js')
   const hit = getDb().getSubjectCache(id)
   if (hit) return { subject: hit.subject, aliases: hit.aliases, fromCache: true }
-  const subject = await getSubject(id)
-  const aliases = subject.aliases ?? [subject.name, subject.nameCn].filter(Boolean)
-  getDb().setSubjectCache(id, subject, aliases)
-  return { subject, aliases, fromCache: false }
+  try {
+    const subject = await getSubject(id)
+    const aliases = subject.aliases ?? [subject.name, subject.nameCn].filter(Boolean)
+    getDb().setSubjectCache(id, subject, aliases)
+    return { subject, aliases, fromCache: false }
+  } catch (e) {
+    const { logActivity } = await import('./db.js')
+    logActivity('warn', 'bgm-api', 'subject #' + id + ' 拉取失败：' + (e instanceof Error ? e.message : String(e)))
+    throw e
+  }
 }
 
 /** 取本篇剧集列表（6 小时缓存） */
@@ -122,7 +128,17 @@ export async function getEpisodesCached(subjectId: number): Promise<BangumiEpiso
   const { getDb } = await import('./db.js')
   const hit = getDb().getEpisodesCache(subjectId)
   if (hit) return hit.episodes
-  const episodes = await getEpisodes(subjectId)
-  getDb().setEpisodesCache(subjectId, episodes)
-  return episodes
+  // 网络失败时回退陈缓存（stale-on-error,2026-09-05）：放送日期基本固化，
+  // 离线也不能让「已放送」整列消失——宁可用旧日期
+  try {
+    const episodes = await getEpisodes(subjectId)
+    getDb().setEpisodesCache(subjectId, episodes)
+    return episodes
+  } catch (e) {
+    const { logActivity } = await import('./db.js')
+    logActivity('warn', 'bgm-api', 'episodes #' + subjectId + ' 刷新失败：' + (e instanceof Error ? e.message : String(e)))
+    const stale = getDb().getEpisodesCache(subjectId, true)
+    if (stale) return stale.episodes
+    throw e
+  }
 }

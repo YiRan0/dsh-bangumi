@@ -17,7 +17,7 @@ import { getEpisodesCached, getSubjectCached, searchSubjects, type BangumiSubjec
 import { configureNet, getNetConfig, netFetch, netFetchText, parseProxyUrl, type NetRequestInit, type NetResponse, type ProxyConfig } from './host/net.js'
 import { subjectCardHtml } from './host/card.js'
 import { scanLibrary, buildByTitle, buildByDir, findEpisodesInLibrary, findBestCandidate, type LibrarySnapshot, type PosterCandidate } from './host/library.js'
-import { getDb } from './host/db.js'
+import { getDb, logActivity } from './host/db.js'
 import { rankItems, type ScoredItem } from './host/match.js'
 import { detectPack, normalizeTitle, parseEpisode } from './host/parse.js'
 import { decideDownloads, collectHave, isCovered, type DecisionAction } from './host/decision.js'
@@ -1162,6 +1162,7 @@ export function apply(ctx: Context, config: Config): void {
       rt.resetCaches = false
       // 持久化快照 -> sqlite（启动时据此水合；root 标记用于下次扫描剔除消失目录）
       getDb().replaceLibrary(snap.files, snap.roots, snap.scannedAt)
+      logActivity('info', 'library', '媒体库扫描完成：' + snap.files.length + ' 个文件，' + Object.keys(snap.byDir).length + ' 个目录')
       // 介入点3：媒体库更新后 AI 判断（新增文件/变化作品/订阅缺集；未配置跳过）
       if (rt.ai.enabled) {
         try {
@@ -1202,6 +1203,7 @@ export function apply(ctx: Context, config: Config): void {
           }
         } catch (err) {
           logger.warn('bangumi ai-library scan note fail: %s', err instanceof Error ? err.message : String(err))
+      logActivity('warn', 'library-ai', 'AI 判新失败：' + (err instanceof Error ? err.message : String(err)))
         }
       }
       return snap
@@ -1261,16 +1263,27 @@ export function apply(ctx: Context, config: Config): void {
               return sendJson(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err), via: '(runtime)', ms: Date.now() - t0, url: url0 })
             }
           }
+          if (route === '/logs' && req.method === 'GET') {
+            return sendJson(res, 200, { logs: getDb().listLogs(200) })
+          }
+          if (route === '/logs/clear' && req.method === 'POST') {
+            getDb().clearLogs()
+            return sendJson(res, 200, { cleared: true })
+          }
           if (route === '/subscriptions' && req.method === 'GET') {
             await getLibrary()
             const state = getState()
             const rows = []
             for (const sub of state.subscriptions) {
+              // 封面：订阅行本身不带 images，回查 subject_cache（同 /library/posters 口径，2026-09-05 修复）
+              const cached = getDb().getSubjectCache(sub.bangumiId)
+              const img = cached?.subject.images?.common ?? cached?.subject.images?.large
+              const cover = img ? '/api/bangumi/cover?u=' + encodeURIComponent(img) : undefined
               try {
                 const progress = await progressFor(rt, sub)
-                rows.push({ ...sub, progress })
+                rows.push({ ...sub, cover, progress })
               } catch {
-                rows.push({ ...sub, progress: null })
+                rows.push({ ...sub, cover, progress: null })
               }
             }
             return sendJson(res, 200, { subscriptions: rows })
@@ -1287,11 +1300,13 @@ export function apply(ctx: Context, config: Config): void {
             void pollSubscriptions(rt, logger).then((fresh) => {
               if (fresh.length) logger.info('bangumi post-subscribe fetched %d episode(s) for %s', fresh.length, sub.id)
             }).catch((err) => logger.warn('bangumi post-subscribe poll fail: %s', err instanceof Error ? err.message : String(err)))
+            logActivity('info', 'subscribe', '新增订阅：' + (sub.nameCn || sub.name) + '（bgm #' + sub.bangumiId + '，源 ' + sub.source + '）')
             return sendJson(res, 200, { subscription: sub })
           }
           if (route === '/subscriptions/delete' && req.method === 'POST') {
             const body = JSON.parse((await readBody(req)) || '{}')
             const sub = await unsubscribeBangumi(rt, String(body.id))
+            logActivity('info', 'unsubscribe', '退订：' + (sub.nameCn || sub.name) + '（bgm #' + sub.bangumiId + '）')
             return sendJson(res, 200, { removed: sub.id })
           }
           if (route === '/poll' && req.method === 'POST') {
@@ -1475,6 +1490,7 @@ export function apply(ctx: Context, config: Config): void {
               }, logger)
               if (!gated.ok) return sendJson(res, 403, { ok: false, error: 'AI 审核未通过（详情见日志）' })
             }
+            logActivity('info', 'download', '推送磁链到 qB：' + String(body.title ?? '').slice(0, 80))
             await rt.qb.addMagnet(String(body.magnet), { savePath: sp || undefined, category: cat, tags: rt.cfg.qbTags })
             const dlState = getState()
             dlState.downloads.push({ magnet: String(body.magnet), title: dtitle, bangumiId: bgmId, origin: 'qb', at: Date.now() })
@@ -1563,20 +1579,31 @@ export function apply(ctx: Context, config: Config): void {
             for (const g of works.values()) {
               const displayName = g.key
               const episodes = [...new Set(g.episodes)].sort((a, b) => a - b)
-              // 匹配键：目录名优先，取不到可读标题时用抽样文件解析出的 title
-              let matchKey = displayName
+              // 匹配键：目录名优先，逐键尝试；文件名解析标题只作为后备（发布串常洗不出
+              // 干净标题——如 Mushoku.Tensei...S03E10 整串——覆盖目录名会匹配失败。2026-09-05 修复）
+              const matchKeys = [normalizeTitle(displayName)]
               for (const n of g.names) {
-                const t = parseEpisode(n).title
-                if (t && t.length > 1 && t !== displayName) { matchKey = t; break }
+                const tt = parseEpisode(n).title
+                if (tt && tt.length > 1) {
+                  const k = normalizeTitle(tt)
+                  if (k && !matchKeys.includes(k)) matchKeys.push(k)
+                }
+                if (matchKeys.length >= 4) break
               }
-              const best = findBestCandidate(normalizeTitle(matchKey), cands)
+              // 先只在「订阅」候选里匹配：同一作品多季时，本地目录几乎一定是订阅在管的那季
+              // （最长别名裁定会误配——如目录「无职转生」被 S1 的 69 字长别名抢走，实为 S3。2026-09-05）
+              const subCands = cands.filter((c) => c.id !== undefined && subByBgmId.has(c.id))
+              let best: PosterCandidate | undefined
+              for (const k of matchKeys) { best = findBestCandidate(k, subCands); if (best) break }
+              if (!best) for (const k of matchKeys) { best = findBestCandidate(k, cands); if (best) break }
               if (!best) {
                 // 未命中缓存：用目录名/可读标题做一次 bgm 搜索反查（拿搜索结果里中文名/原名与 key 精确一致者）；
                 // 命中则深拉 getSubjectCached 回填 subject_cache（后续打开零网络）。失败静默降级灰卡。
                 let looked: PosterCandidate | undefined
                 try {
-                  const hits = await searchSubjects(matchKey.length > 1 ? matchKey : displayName, 6)
-                  const exact = hits.find((s) => (s.nameCn && normalizeTitle(s.nameCn) === normalizeTitle(matchKey)) || (s.name && normalizeTitle(s.name) === normalizeTitle(matchKey)))
+                  // 远端反查：用目录名（最干净的键），逐个后备键重试到有空结果为止
+                  let hits = await searchSubjects(displayName, 6)
+                  const exact = hits.find((s) => (s.nameCn && normalizeTitle(s.nameCn) === matchKeys[0]) || (s.name && normalizeTitle(s.name) === matchKeys[0]))
                   const chosen = exact ?? hits[0]
                   if (chosen) {
                     const fresh = await getSubjectCached(chosen.id)
@@ -1674,7 +1701,7 @@ export function apply(ctx: Context, config: Config): void {
             const month = Number(url.searchParams.get('month')) || new Date().getMonth() + 1
             const state = getState()
             const days = new Date(year, month, 0).getDate()
-            const calendar: Array<{ date: string; items: Array<{ name: string; nameCn: string; episode: number | null }> }> = []
+            const calendar: Array<{ date: string; items: Array<{ name: string; nameCn: string; episode: number | null; source?: string }> }> = []
             // 每订阅一次性拉 episodes 表 → date→ep 映射（缓存 6h；失败回退估算）
             const perSubEps: Array<{ sub: (typeof state.subscriptions)[number]; map: Map<string, number> }> = []
             for (const sub of state.subscriptions) {
@@ -1687,7 +1714,7 @@ export function apply(ctx: Context, config: Config): void {
             }
             for (let d = 1; d <= days; d += 1) {
               const iso = year + '-' + String(month).padStart(2, '0') + '-' + String(d).padStart(2, '0')
-              const items: Array<{ name: string; nameCn: string; episode: number | null }> = []
+              const items: Array<{ name: string; nameCn: string; episode: number | null; source?: string }> = []
               for (const { sub, map } of perSubEps) {
                 let ep: number | null = null
                 const known = map.get(iso)
@@ -1705,7 +1732,7 @@ export function apply(ctx: Context, config: Config): void {
                     if (est !== null && (sub.totalEpisodes === undefined || est <= sub.totalEpisodes)) ep = est
                   }
                 }
-                if (ep !== null) items.push({ name: sub.name, nameCn: sub.nameCn, episode: ep })
+                if (ep !== null) items.push({ name: sub.name, nameCn: sub.nameCn, episode: ep, source: sub.source })
               }
               if (items.length) calendar.push({ date: iso, items })
             }
@@ -2019,6 +2046,7 @@ export function apply(ctx: Context, config: Config): void {
           }, logger)
           if (!gated.ok) return 'AI 审核未通过，已取消下载（详情见日志）。'
         }
+        logActivity('info', 'download', '推送磁链到 qB：' + String(args.title ?? '').slice(0, 80))
         await rt.qb.addMagnet(args.magnet, { savePath: sp || undefined, category: cat, tags: rt.cfg.qbTags })
         const state = getState()
         state.downloads.push({ magnet: args.magnet, title: dtitle || args.magnet.slice(0, 40), origin: 'qb', at: Date.now() })
