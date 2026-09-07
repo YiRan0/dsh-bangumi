@@ -1,0 +1,6 @@
+# dsh-bangumi bundle patch: register the plugin in the web profile roster.
+# 实际开发环境通过 dsh-super-injector 运行时注入（junction + registry）；
+# 此 bundle 声明使仓库可通过 `dsh plugin add YiRan0/dsh-bangumi` 标准安装。
+- insert:
+    - id: dsh-bangumi
+      name: '@dsh-external/dsh-bangumi'
